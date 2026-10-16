@@ -1,119 +1,191 @@
-import mongoose from 'mongoose';
-import type { QueryFilter } from 'mongoose';
 import type { Request, Response } from 'express';
-import { z } from 'zod';
-import { Conversation } from '../models/conversation.model.js';
-import type { ConversationDocument } from '../models/conversation.model.js';
-import { Message } from '../models/message.model.js';
-import type { IMessage, MessageDocument } from '../models/message.model.js';
+import { randomUUID } from 'node:crypto';
 import { HttpError } from '../middleware/error.middleware.js';
-import { decodeCursor, encodeCursor } from '../utils/cursor.js';
-import { getIO } from '../sockets/index.js';
+import {
+  editMessage,
+  editMessageSchema,
+  forwardMessage,
+  forwardMessageSchema,
+  listMessages,
+  listMessagesSchema,
+  sendMessage,
+  sendMessageSchema,
+} from '../services/message.service.js';
+import { getConversationForMember } from '../services/conversation.service.js';
+import {
+  emitConversationNew,
+  emitForwardedMessages,
+  emitMessageEdited,
+  emitNewMessage,
+} from '../sockets/emitters.js';
+import { storage } from '../services/storage.service.js';
+import { getFileExtension } from '../services/user.service.js';
+import { determineMediaType } from '../middleware/upload.middleware.js';
+import { routeParam } from '../utils/routeParam.js';
+import type { AttachmentDto } from '../types/chat.js';
 
-const sendMessageSchema = z.object({
-  content: z.string().trim().min(1).max(4000),
-});
-
-const listMessagesSchema = z.object({
-  cursor: z.string().min(1).optional(),
-  limit: z.coerce.number().int().min(1).max(100).default(30),
-});
-
-interface PopulatedSender {
-  _id: mongoose.Types.ObjectId;
-  username: string;
-  avatarUrl?: string;
+function requireUserId(req: Request): string {
+  const userId = req.user?.id;
+  if (!userId) {
+    throw new HttpError(401, 'Not authenticated');
+  }
+  return userId;
 }
 
-function toMessageDto(message: MessageDocument) {
-  const sender = message.sender as unknown as PopulatedSender;
-  return {
-    id: message.id as string,
-    conversationId: message.conversation.toString(),
-    content: message.content,
-    sender: {
-      id: sender._id.toString(),
-      username: sender.username,
-      avatarUrl: sender.avatarUrl ?? null,
-    },
-    createdAt: message.createdAt,
-  };
-}
-
-// Express 5 types route params as `string | string[]`; normalize to a single string.
-function routeParam(value: string | string[] | undefined): string {
-  return Array.isArray(value) ? (value[0] ?? '') : (value ?? '');
-}
-
-async function assertMembership(
+/**
+ * Uploads each multipart file to object storage and returns attachment metadata.
+ * Shared by the JSON/multipart send endpoint and the dedicated attachment-upload
+ * endpoint used for the socket send flow.
+ */
+async function storeUploadedFiles(
+  files: Express.Multer.File[],
   conversationId: string,
   userId: string,
-): Promise<ConversationDocument> {
-  if (!mongoose.isValidObjectId(conversationId)) {
-    throw new HttpError(400, 'Invalid conversation id');
+): Promise<Array<AttachmentDto & { key: string }>> {
+  const attachments: Array<AttachmentDto & { key: string }> = [];
+  for (const file of files) {
+    const extension = getFileExtension(file.mimetype) || '';
+    const key = `messages/${conversationId}/${userId}/${randomUUID()}${extension}`;
+    const { url } = await storage.upload({
+      key,
+      buffer: file.buffer,
+      contentType: file.mimetype,
+    });
+    attachments.push({
+      type: determineMediaType(file.mimetype),
+      url,
+      key,
+      name: file.originalname,
+      size: file.size,
+      mimeType: file.mimetype,
+    });
   }
-  const conversation = await Conversation.findOne({ _id: conversationId, participants: userId });
-  if (!conversation) {
-    throw new HttpError(404, 'Conversation not found');
-  }
-  return conversation;
+  return attachments;
 }
 
-export async function sendMessage(req: Request, res: Response): Promise<void> {
-  const userId = req.user?.id;
-  if (!userId) {
-    throw new HttpError(401, 'Not authenticated');
+/** Reads an optional integer `duration` (seconds) from a multipart body. */
+function parseDuration(value: unknown): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    return undefined;
   }
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds) : undefined;
+}
 
-  const conversation = await assertMembership(routeParam(req.params.conversationId), userId);
-  const { content } = sendMessageSchema.parse(req.body);
+export async function sendMessageHandler(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req);
+  const conversationId = routeParam(req.params.conversationId);
 
-  const message = await Message.create({
-    conversation: conversation._id,
-    sender: userId,
-    content,
+  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
+  const uploaded = req.file ? [...files, req.file] : files;
+  const attachments =
+    uploaded.length > 0 ? await storeUploadedFiles(uploaded, conversationId, userId) : [];
+
+  const input = sendMessageSchema.parse({
+    ...(req.body as Record<string, unknown>),
+    conversationId,
+    attachments: attachments.length > 0 ? attachments : undefined,
   });
-  await message.populate('sender', 'username avatarUrl');
+  const { message, participantIds, createdConversation } = await sendMessage({
+    ...input,
+    senderId: userId,
+  });
 
-  conversation.lastMessage = message._id as mongoose.Types.ObjectId;
-  conversation.lastMessageAt = message.createdAt;
-  await conversation.save();
+  // A private reply may have created a direct conversation: announce it before
+  // the message so recipients can resolve the conversation.
+  if (createdConversation) {
+    emitConversationNew(
+      createdConversation.participants.map((participant) => participant.id),
+      createdConversation,
+      userId,
+    );
+  }
 
-  const dto = toMessageDto(message);
-  const rooms = conversation.participants.map((participant) => `user:${participant.toString()}`);
-  getIO()?.to(rooms).emit('message:new', dto);
-
-  res.status(201).json({ message: dto });
+  emitNewMessage(participantIds, message, userId);
+  res
+    .status(201)
+    .json({ message, ...(createdConversation && { conversation: createdConversation }) });
 }
 
-export async function listMessages(req: Request, res: Response): Promise<void> {
-  const userId = req.user?.id;
-  if (!userId) {
-    throw new HttpError(401, 'Not authenticated');
+/**
+ * Uploads message media (including voice notes) and returns attachment metadata
+ * WITHOUT creating a message. The client then sends the message over Socket.IO
+ * (`message:send`) with the returned attachments. Only conversation members can
+ * upload (non-members get 404, so ids cannot be probed).
+ */
+export async function uploadAttachmentsHandler(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req);
+  const conversationId = routeParam(req.params.conversationId);
+
+  await getConversationForMember(conversationId, userId);
+
+  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
+  if (files.length === 0) {
+    throw new HttpError(400, 'No files uploaded (expected multipart field "files")');
   }
 
-  const conversation = await assertMembership(routeParam(req.params.conversationId), userId);
+  const duration = parseDuration((req.body as Record<string, unknown> | undefined)?.duration);
+  const attachments = (await storeUploadedFiles(files, conversationId, userId)).map((attachment) =>
+    duration !== undefined && (attachment.type === 'audio' || attachment.type === 'video')
+      ? { ...attachment, duration }
+      : attachment,
+  );
+
+  res.status(201).json({ attachments });
+}
+
+/** Edits the content of one of the caller's own text messages (within 15 min). */
+export async function editMessageHandler(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req);
+  const input = editMessageSchema.parse(req.body);
+
+  const { message, participantIds } = await editMessage({
+    ...input,
+    conversationId: routeParam(req.params.conversationId),
+    messageId: routeParam(req.params.messageId),
+    userId,
+  });
+
+  emitMessageEdited(participantIds, message, userId);
+  res.json({ message });
+}
+
+export async function listMessagesHandler(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req);
+
   const { cursor, limit } = listMessagesSchema.parse(req.query);
+  const result = await listMessages({
+    conversationId: routeParam(req.params.conversationId),
+    userId,
+    cursor,
+    limit,
+  });
 
-  // Keyset pagination: `_id` descending. Older pages are fetched with a cursor
-  // pointing at the oldest message the client already has.
-  const filter: QueryFilter<IMessage> = { conversation: conversation._id };
-  if (cursor) {
-    filter._id = { $lt: new mongoose.Types.ObjectId(decodeCursor(cursor)) };
-  }
+  res.json(result);
+}
 
-  const docs = await Message.find(filter)
-    .sort({ _id: -1 })
-    .limit(limit + 1)
-    .populate('sender', 'username avatarUrl');
+/**
+ * Forwards a message to other conversations and/or users (see
+ * `forwardMessageSchema`). Each copy is a new message in the target chat.
+ */
+export async function forwardMessageHandler(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req);
+  const input = forwardMessageSchema.parse(req.body);
 
-  const hasMore = docs.length > limit;
-  const page = hasMore ? docs.slice(0, limit) : docs;
-  const oldest = page.at(-1);
+  const { messages, deliveries, createdConversations } = await forwardMessage({
+    ...input,
+    conversationId: routeParam(req.params.conversationId),
+    messageId: routeParam(req.params.messageId),
+    userId,
+  });
 
-  res.json({
-    items: page.map(toMessageDto),
-    nextCursor: hasMore && oldest ? encodeCursor(oldest.id as string) : null,
-    hasMore,
+  // Announce direct conversations created for `userIds` targets first, so
+  // recipients can resolve the chat before its message arrives.
+  emitForwardedMessages(deliveries, createdConversations, userId);
+
+  res.status(201).json({
+    messages,
+    ...(createdConversations.length > 0 && { conversations: createdConversations }),
   });
 }

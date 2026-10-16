@@ -1,4 +1,5 @@
 import { connectDatabase, disconnectDatabase } from './config/db.js';
+import { drainEmailQueue } from './services/email.service.js';
 import { createServer, startServer } from './server.js';
 
 async function main(): Promise<void> {
@@ -10,6 +11,8 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`Received ${signal}, shutting down...`);
     httpServer.close(async () => {
+      // Flush queued email (bounded) before dropping the DB connection.
+      await drainEmailQueue();
       await disconnectDatabase();
       process.exit(0);
     });

@@ -1,0 +1,223 @@
+# Chatrix API Examples (REST Client / httpyac)
+@baseUrl = http://localhost:5000/api/v1
+
+### Register
+# With email verification enabled (default) this creates an UNVERIFIED account and
+# sets no cookies. Check the server console (or inbox) for the link, then call
+# "Verify Email" below. Login returns 403 until verified.
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "username": "alice",
+  "email": "alice@example.com",
+  "password": "Str0ng!Pass",
+  "confirmPassword": "Str0ng!Pass"
+}
+
+### Login
+# Returns 403 { "message": "Email not verified. ..." } until the email is verified.
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "alice@example.com",
+  "password": "Str0ng!Pass"
+}
+
+### Verify Email (token from the emailed link)
+POST {{baseUrl}}/auth/verify-email
+Content-Type: application/json
+
+{
+  "token": "PASTE_TOKEN_FROM_EMAIL"
+}
+
+### Resend Verification Email (always 202)
+POST {{baseUrl}}/auth/resend-verification
+Content-Type: application/json
+
+{
+  "email": "alice@example.com"
+}
+
+### Me
+GET {{baseUrl}}/auth/me
+
+### Refresh
+POST {{baseUrl}}/auth/refresh
+
+### Logout
+POST {{baseUrl}}/auth/logout
+
+### Update Profile
+PATCH {{baseUrl}}/users/me
+Content-Type: application/json
+
+{
+  "displayName": "Alice",
+  "bio": "Hi!"
+}
+
+### Get Settings
+GET {{baseUrl}}/users/me/settings
+
+### Update Settings (partial — only the fields you send change)
+# theme: "light" | "dark" | "system"; notifications + readReceipts: booleans.
+PATCH {{baseUrl}}/users/me/settings
+Content-Type: application/json
+
+{
+  "theme": "dark"
+}
+
+### Disable Read Receipts (others stop seeing when you read their messages)
+PATCH {{baseUrl}}/users/me/settings
+Content-Type: application/json
+
+{
+  "readReceipts": false
+}
+
+### Disable New-Message Email Notifications (for messages you receive while offline)
+PATCH {{baseUrl}}/users/me/settings
+Content-Type: application/json
+
+{
+  "notifications": false
+}
+
+### Update Several Settings at Once
+PATCH {{baseUrl}}/users/me/settings
+Content-Type: application/json
+
+{
+  "theme": "light",
+  "notifications": true,
+  "readReceipts": true
+}
+
+### Search Users
+GET {{baseUrl}}/users/search?q=ali
+
+### User Profile
+GET {{baseUrl}}/users/64f123abc456def789012346
+
+### List Conversations
+# Each item includes `unreadCount` (messages addressed to you that you haven't read).
+GET {{baseUrl}}/conversations
+
+### Create Direct
+POST {{baseUrl}}/conversations
+Content-Type: application/json
+
+{
+  "type": "direct",
+  "participantIds": ["64f123abc456def789012346"]
+}
+
+### Create Group
+POST {{baseUrl}}/conversations
+Content-Type: application/json
+
+{
+  "type": "group",
+  "name": "Team",
+  "participantIds": ["64f123abc456def789012346", "64f123abc456def789012349"]
+}
+
+### Rename Group (group only, any member)
+PATCH {{baseUrl}}/conversations/64f123abc456def789012348
+Content-Type: application/json
+
+{
+  "name": "Weekend Trip"
+}
+
+### Set / Replace Group Icon (group only, any member; multipart field "avatar")
+# JPEG/PNG/WebP/GIF, <=5MB. Returns { conversation } and emits conversation:updated.
+POST {{baseUrl}}/conversations/64f123abc456def789012348/avatar
+Content-Type: multipart/form-data; boundary=----ChatrixBoundary
+
+------ChatrixBoundary
+Content-Disposition: form-data; name="avatar"; filename="icon.png"
+Content-Type: image/png
+
+< ./icon.png
+------ChatrixBoundary--
+
+### Delete Group Icon
+DELETE {{baseUrl}}/conversations/64f123abc456def789012348/avatar
+
+### Invite Users to Group (group only, any member; max 50)
+# Invitees get conversation:new; existing members get conversation:updated.
+POST {{baseUrl}}/conversations/64f123abc456def789012348/participants
+Content-Type: application/json
+
+{
+  "participantIds": ["64f123abc456def789012350"]
+}
+
+### Send Message
+POST {{baseUrl}}/conversations/64f123abc456def789012347/messages
+Content-Type: application/json
+
+{
+  "content": "Hey!"
+}
+
+### Reply Privately (DM to the quoted message's author)
+# If a new DM is created, the response also includes "conversation".
+POST {{baseUrl}}/conversations/64f123abc456def789012347/messages
+Content-Type: application/json
+
+{
+  "content": "Let's talk 1:1",
+  "replyToId": "64f123abc456def789012350",
+  "replyPrivately": true
+}
+
+### Edit Message (own text message, within 15 minutes)
+# Returns { message } and emits message:edited to others.
+PATCH {{baseUrl}}/conversations/64f123abc456def789012347/messages/64f123abc456def789012350
+Content-Type: application/json
+
+{
+  "content": "Hey! (edited)"
+}
+
+### Forward Message (to conversations and/or users; each copy is a send)
+# conversationIds = existing chats; userIds = people (direct chat found/created).
+# The copy is re-attributed to you and marked \"forwarded\": true.
+POST {{baseUrl}}/conversations/64f123abc456def789012347/messages/64f123abc456def789012350/forward
+Content-Type: application/json
+
+{
+  "conversationIds": ["64f123abc456def789012348"],
+  "userIds": ["64f123abc456def789012351"]
+}
+
+### Upload Voice Note / Attachments (returns attachments; then send via socket message:send)
+# multipart/form-data: field "files" (1-10), optional "duration" (seconds)
+POST {{baseUrl}}/conversations/64f123abc456def789012347/attachments
+Content-Type: multipart/form-data; boundary=----ChatrixBoundary
+
+------ChatrixBoundary
+Content-Disposition: form-data; name="duration"
+
+7
+------ChatrixBoundary
+Content-Disposition: form-data; name="files"; filename="voice-note.webm"
+Content-Type: audio/webm
+
+< ./voice-note.webm
+------ChatrixBoundary--
+
+### Conversation Presence (online / last seen)
+GET {{baseUrl}}/conversations/64f123abc456def789012347/presence
+
+### List Messages
+GET {{baseUrl}}/conversations/64f123abc456def789012347/messages
+
+### List Messages with Cursor
+GET {{baseUrl}}/conversations/64f123abc456def789012347/messages?cursor=CURSOR&limit=30
