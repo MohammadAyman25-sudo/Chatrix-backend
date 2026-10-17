@@ -2,7 +2,8 @@ import { User } from '../models/user.model.js';
 import type { MessageType } from '../models/message.model.js';
 import type { ConversationType } from '../models/conversation.model.js';
 import { isOnline } from '../sockets/presence.js';
-import { conversationUrl, enqueueEmailJob, queueMessageNotification } from './email.service.js';
+import { conversationUrl, queueMessageNotification } from './email.service.js';
+import { enqueueJob, registerJobHandler } from './job.service.js';
 
 /** At most one notification email per recipient per conversation in this window. */
 export const MESSAGE_NOTIFICATION_WINDOW_MS = 10 * 60 * 1000;
@@ -131,9 +132,9 @@ export function queueNewMessageNotification(input: NewMessageNotificationInput):
     isGroup,
   };
 
-  enqueueEmailJob(`message-notification:${input.conversationId}`, () =>
-    deliverMessageNotifications(delivery),
-  );
+  // Resolving the recipients' addresses needs the database, so it happens in
+  // the background worker, not on the send path.
+  void enqueueJob({ type: 'email:notification-batch', payload: delivery });
 }
 
 /**
@@ -159,3 +160,9 @@ async function deliverMessageNotifications(delivery: NotificationDelivery): Prom
     });
   }
 }
+
+// The queue persists `NotificationDelivery` as the job payload, so this handler
+// must stay a pure function of that data (no closures over request state).
+registerJobHandler('email:notification-batch', async (payload) => {
+  await deliverMessageNotifications(payload as NotificationDelivery);
+});

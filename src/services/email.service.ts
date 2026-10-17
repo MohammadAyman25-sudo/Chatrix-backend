@@ -1,6 +1,6 @@
 import { Resend } from 'resend';
 import { env } from '../config/env.js';
-import { JobQueue } from '../utils/queue.js';
+import { drainJobQueue, enqueueJob, jobQueueSize, registerJobHandler } from './job.service.js';
 
 export interface VerificationEmail {
   to: string;
@@ -153,53 +153,38 @@ function createMailer(): Mailer {
 export const mailer: Mailer = createMailer();
 
 /**
- * All outbound mail goes through this queue so a slow or failing provider never
- * blocks a request. Jobs are retried with exponential backoff; exhausted jobs
- * are logged (the user can always request a new verification link).
+ * Email jobs ride the persistent queue (`job.service.ts`), so a mail that is
+ * queued just before a restart is still delivered afterwards, and retries with
+ * exponential backoff survive too. Handlers are registered here because this
+ * module owns the mailer.
  */
-export const emailQueue = new JobQueue({
-  concurrency: 1,
-  maxAttempts: 3,
-  baseDelayMs: 1000,
-  onError: (job, error) => {
-    console.error(`[email] job "${job.label}" failed after all retries:`, error);
-  },
+registerJobHandler('email:verification', async (payload) => {
+  await mailer.sendVerificationEmail(payload as VerificationEmail);
 });
 
-/** Enqueues a raw job on the shared email queue. Returns the job id. */
-export function enqueueEmailJob(label: string, run: () => Promise<void>): string {
-  return emailQueue.enqueue(label, run);
-}
+registerJobHandler('email:message-notification', async (payload) => {
+  await mailer.sendMessageNotification(payload as MessageNotificationEmail);
+});
 
 /** Queues a verification email (never blocks the registration request). */
-export function queueVerificationEmail(email: VerificationEmail): string {
-  return emailQueue.enqueue(`verification:${email.to}`, () => mailer.sendVerificationEmail(email));
+export function queueVerificationEmail(email: VerificationEmail): void {
+  void enqueueJob({ type: 'email:verification', payload: email });
 }
 
 /** Queues a new-message notification email. */
-export function queueMessageNotification(email: MessageNotificationEmail): string {
-  return emailQueue.enqueue(`notification:${email.to}`, () =>
-    mailer.sendMessageNotification(email),
-  );
+export function queueMessageNotification(email: MessageNotificationEmail): void {
+  void enqueueJob({ type: 'email:message-notification', payload: email });
 }
 
-/** Queued (not yet started) email jobs. */
+/** Queued (not yet started) jobs of every kind. */
 export function emailQueueSize(): number {
-  return emailQueue.size();
+  return jobQueueSize();
 }
 
 /**
- * Waits for in-flight/queued email to finish, up to `timeoutMs`, so a shutdown
- * has a chance to flush mail without hanging on a bad provider.
+ * Waits for in-flight/queued background work to finish, up to `timeoutMs`, so a
+ * shutdown has a chance to flush mail without hanging on a bad provider.
  */
 export async function drainEmailQueue(timeoutMs = 5000): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<void>((resolve) => {
-    timer = setTimeout(resolve, timeoutMs);
-    timer.unref?.();
-  });
-  await Promise.race([emailQueue.drain(), timeout]);
-  if (timer) {
-    clearTimeout(timer);
-  }
+  await drainJobQueue(timeoutMs);
 }

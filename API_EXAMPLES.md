@@ -3,11 +3,91 @@
 Base URL: `http://localhost:5000/api/v1`
 Auth: httpOnly cookies (`access_token`, `refresh_token`), so send requests with credentials (Cookie jar). All errors follow the error middleware shape: `{ "message": "..." }`.
 
-Email verification: enabled by default (`EMAIL_VERIFICATION_ENABLED=true`). Registration creates the account **unverified and without a session**; the user must confirm via the emailed link (`POST /auth/verify-email`) before `POST /auth/login` will succeed. Every `PublicUser` exposes `emailVerified`. When `RESEND_API_KEY` is unset, verification emails are printed to the server console instead of sent. Set `EMAIL_VERIFICATION_ENABLED=false` to skip verification entirely (register then issues cookies as before). All outbound mail is queued in memory and sent in the background (never blocking the request), with retries on failure.
+Email verification: enabled by default (`EMAIL_VERIFICATION_ENABLED=true`). Registration creates the account **unverified and without a session**; the user must confirm via the emailed link (`POST /auth/verify-email`) before `POST /auth/login` will succeed. Every `PublicUser` exposes `emailVerified`. When `RESEND_API_KEY` is unset, verification emails are printed to the server console instead of sent. Set `EMAIL_VERIFICATION_ENABLED=false` to skip verification entirely (register then issues cookies as before). All outbound mail runs as jobs on a **persistent MongoDB-backed queue** and is delivered in the background (never blocking the request), with backoff retries that survive restarts.
 
 New-message notifications: when someone sends you a message while you are offline, the backend emails you a short preview (subject/body naming the sender or group) at most once per conversation per 10 minutes, unless your `settings.notifications` is `false`. Online users are not emailed (they get `message:new` over the socket). A message with no text shows a media label (📷 Photo, 🎥 Video, 🎙️ Voice message, 📎 Attachment).
 
-Rate limiting: all API routes are limited per client IP (600 requests / 15 min). Additional per-route limits apply and return `429` with `{ "message": "..." }`: `/auth/login`, `/auth/register`, `/auth/verify-email` and `/auth/resend-verification` (10 / 15 min per IP), `/auth/refresh` (60 / 15 min), `GET /users/search` (30 / min per user), message sends (60 / min per user, both REST and Socket.IO), message edits and forwards over sockets (30 / min per user), message attachment uploads (60 / min per user) and avatar/group-icon uploads (30 / 15 min per user). Set `RATE_LIMIT_ENABLED=false` to disable locally.
+Rate limiting: all API routes are limited per client IP (600 requests / 15 min). Additional per-route limits apply and return `429` with `{ "message": "..." }`: `/auth/login`, `/auth/register`, `/auth/verify-email` and `/auth/resend-verification` (10 / 15 min per IP), `/auth/refresh` (60 / 15 min), `GET /users/search` (30 / min per user), `GET /messages/search` (30 / min per user), message sends (60 / min per user, both REST and Socket.IO), message edits and forwards over sockets (30 / min per user), upload signing (30 / 15 min per user) and upload confirmation (60 / min per user). Set `RATE_LIMIT_ENABLED=false` to disable locally.
+
+Uploads: files are uploaded **directly from the client to Cloudflare R2** with a presigned `PUT` URL — no `multipart/form-data` and no file bytes through this API. Every upload (message media, voice notes, avatars, group icons) is the same `sign → PUT → confirm` flow; see [Uploads (direct to R2)](#uploads-direct-to-r2) for the full examples.
+
+## Uploads (direct to R2)
+
+### POST /uploads/sign (auth required)
+
+Checks membership/limits, records a pending upload and returns a presigned `PUT` URL (valid 15 minutes).
+
+**Body:**
+
+```json
+{
+  "scope": "message",
+  "conversationId": "64f123abc456def789012347",
+  "name": "holiday.png",
+  "size": 348122,
+  "mimeType": "image/png",
+  "duration": 7
+}
+```
+
+- `scope` — `message` | `avatar` | `group-icon`.
+- `conversationId` — required for `message` / `group-icon` (you must be a member; otherwise `404`); must be omitted for `avatar`.
+- `size` — the exact number of bytes you are about to upload (re-verified on confirm).
+- `mimeType` — must be allowed for the scope (see limits below).
+- `duration` — optional seconds for audio/video, kept on the resulting attachment.
+
+**Response 201:**
+
+```json
+{
+  "upload": {
+    "id": "665f1c0a9b3e4d0012a34567",
+    "key": "messages/64f123abc456def789012347/64f123abc456def789012345/a1b2c3d4.png",
+    "url": "https://<account-id>.r2.cloudflarestorage.com/...&X-Amz-Signature=...",
+    "method": "PUT",
+    "headers": { "Content-Type": "image/png" },
+    "expiresAt": "2026-10-17T16:15:00.000Z"
+  }
+}
+```
+
+The `Content-Type` is **part of the signature** — the `PUT` must send exactly the returned headers.
+
+**Response 400 (limit or MIME violation):** `{ "message": "File is larger than 5MB" }`
+**Response 404 (not a conversation member):** `{ "message": "Conversation not found" }`
+**Response 429:** too many sign requests.
+
+### PUT <upload.url> (to R2, not this API)
+
+```bash
+curl -X PUT "$UPLOAD_URL" --data-binary @holiday.png -H "Content-Type: image/png"
+```
+
+A wrong `Content-Type`, an expired URL or a re-used URL fails with an R2 signature error.
+
+### POST /uploads/:uploadId/confirm (auth required)
+
+`HeadObject`s the object and completes the upload. Idempotent (a retried confirm returns the same result). Rejects a size/content-type mismatch or a missing object with `400` and deletes the pending record; unknown ids return `404`.
+
+**Response 201 — scope `message` (pass `attachment` to `message:send` / `POST …/messages`):**
+
+```json
+{
+  "attachment": {
+    "type": "image",
+    "url": "https://pub-example.r2.dev/messages/64f123abc456def789012347/64f123abc456def789012345/a1b2c3d4.png",
+    "key": "messages/64f123abc456def789012347/64f123abc456def789012345/a1b2c3d4.png",
+    "name": "holiday.png",
+    "size": 348122,
+    "mimeType": "image/png"
+  }
+}
+```
+
+- scope `avatar` → `{ "user": { ...PublicUser, "avatarUrl": "https://pub-example.r2.dev/avatars/..." } }` (the previous avatar object is deleted).
+- scope `group-icon` → `{ "conversation": { ...ConversationDto, "avatarUrl": "..." } }` and a `conversation:updated` event to the other members.
+
+**Limits:** `message` ≤ **100MB** (images/video/audio/documents — an explicit MIME allow-list), `avatar` and `group-icon` ≤ **5MB** (JPEG/PNG/WebP/GIF). Suggested keys are `messages/<conversationId>/<userId>/<uuid><ext>`, `avatars/<userId>/<uuid><ext>` and `conversations/<conversationId>/icon/<uuid><ext>`. Uploads that are never confirmed are swept after 24 hours by a background job.
 
 ## Auth
 
@@ -218,7 +298,7 @@ Partial update: send only the fields you want to change; omitted fields keep the
 
 - `theme`: `"light" | "dark" | "system"`.
 - `notifications`: turns **new-message email notifications** on/off (`false` opts out). When a message is sent to a conversation while you are offline, the backend emails you at most once per conversation per 10 minutes, unless this is `false`. Online users are never emailed (they get `message:new`).
-- `readReceipts`: when `false`, your read receipts are **not** broadcast — senders stop receiving your `message:status` `"read"` updates (your `"delivered"` updates are unaffected). Defaults to `true`.
+- `readReceipts`: when `false`, your read receipts are **not** broadcast — senders stop receiving your `message:status` `"read"` updates (your `"delivered"` updates are unaffected). In a **direct** chat it also hides your read time from the sender's "Message info" (`GET .../messages/:messageId/info`), which reports `readReceiptsDisabled: true` instead, and the message's `status` never surfaces as `read` to the sender (it stays `delivered`). Ignored in **groups**, where read times are always shown. Defaults to `true`.
 
 **Example — disable both:**
 
@@ -243,16 +323,20 @@ Partial update: send only the fields you want to change; omitted fields keep the
 
 Both endpoints act on the caller (`/users/me`). The same settings object is embedded in every `PublicUser` (e.g. from `login` and `GET /auth/me`).
 
-### POST /users/me/avatar (auth required, multipart/form-data)
+### Set the caller's avatar (direct upload, auth required)
 
-**Form:**
+No multipart: upload with `scope: 'avatar'` (no `conversationId`; JPEG/PNG/WebP/GIF, ≤5MB) following [Uploads (direct to R2)](#uploads-direct-to-r2).
 
-- `avatar` (file) — JPEG/PNG/WebP/GIF, ≤5MB
-
-**Response 200:**
+**POST /uploads/sign body:**
 
 ```json
-{ "user": { ...PublicUser, "avatarUrl": "https://..." } }
+{ "scope": "avatar", "name": "me.jpg", "size": 51200, "mimeType": "image/jpeg" }
+```
+
+After the `PUT`, `POST /uploads/:uploadId/confirm` returns the updated user (and deletes the previous avatar object):
+
+```json
+{ "user": { ...PublicUser, "avatarUrl": "https://pub-example.r2.dev/avatars/64f123abc456def789012345/a1b2.jpg" } }
 ```
 
 ### DELETE /users/me/avatar (auth required)
@@ -336,7 +420,7 @@ Public profile of another user. Returns the same shape as a search result.
       "id": "64f123abc456def789012348",
       "type": "group",
       "name": "Team Chat",
-      "avatarUrl": "/uploads/conversations/64f123abc456def789012348/icon/a1b2.png",
+      "avatarUrl": "https://pub-example.r2.dev/conversations/64f123abc456def789012348/icon/a1b2.png",
       "participants": [
         {
           "id": "64f123abc456def789012345",
@@ -426,16 +510,26 @@ Rename a **group** (any member may). Direct conversations return `400`; non-memb
 { "conversation": { ...ConversationDto, "name": "Weekend Trip" ... } }
 ```
 
-### POST /conversations/:id/avatar (auth required, multipart/form-data)
+### Set a group icon (direct upload, auth required)
 
-Set or replace a **group** icon (any member). Emits `conversation:updated` to the other members. Direct conversations return `400`; non-members `404`.
+Set or replace a **group** icon (any member). Upload with `scope: 'group-icon'` and `conversationId` (JPEG/PNG/WebP/GIF, ≤5MB) — see [Uploads (direct to R2)](#uploads-direct-to-r2). Direct conversations return `400` at sign time; non-members `404`.
 
-**Form:** `avatar` (file) — JPEG/PNG/WebP/GIF, ≤5MB
-
-**Response 200:**
+**POST /uploads/sign body:**
 
 ```json
-{ "conversation": { ...ConversationDto, "avatarUrl": "/uploads/conversations/.../icon/a1b2.png" ... } }
+{
+  "scope": "group-icon",
+  "conversationId": "64f123abc456def789012347",
+  "name": "icon.png",
+  "size": 30500,
+  "mimeType": "image/png"
+}
+```
+
+After the `PUT`, `POST /uploads/:uploadId/confirm` returns the updated conversation and emits `conversation:updated` to the other members:
+
+```json
+{ "conversation": { ...ConversationDto, "avatarUrl": "https://pub-example.r2.dev/conversations/64f123abc456def789012347/icon/a1b2.png" ... } }
 ```
 
 ### DELETE /conversations/:id/avatar (auth required)
@@ -502,6 +596,27 @@ Invite users to a **group** (any member may). Ids already in the group are ignor
 ```
 
 If that DM is new, the response additionally carries `"conversation"` (the created direct `ConversationDto`) and a `conversation:new` event fires first. `replyToId` must belong to this conversation; `400` if it is missing/invalid, or if you are the quoted message's author.
+
+**Body (with attachments):** attachments come from the confirm step of the [direct upload flow](#uploads-direct-to-r2) — the returned `attachment` object goes straight into the array.
+
+```json
+{
+  "type": "image",
+  "content": "Look at this!",
+  "attachments": [
+    {
+      "type": "image",
+      "url": "https://pub-example.r2.dev/messages/64f123abc456def789012347/64f123abc456def789012345/a1b2c3d4.png",
+      "key": "messages/64f123abc456def789012347/64f123abc456def789012345/a1b2c3d4.png",
+      "name": "holiday.png",
+      "size": 348122,
+      "mimeType": "image/png"
+    }
+  ]
+}
+```
+
+A message must have `content` or at least one `attachment` (`400` otherwise). `type` defaults to `text`; the server only uses it to label the message (`image`/`video`/`audio`/`file` for media).
 
 **Response 201:**
 
@@ -584,6 +699,74 @@ At least one target is required (`400` otherwise). Unknown targets return `400`/
 }
 ```
 
+### GET /conversations/:id/messages/:messageId/info (auth required)
+
+Delivery/read receipt detail for **one of your own messages** (the "Message info" screen). Only the message's **sender** may call it — anyone else gets `403`; non-members / unknown messages get `404`.
+
+**Response 200:**
+
+```json
+{
+  "info": {
+    "messageId": "64f123abc456def789012351",
+    "conversationId": "64f123abc456def789012347",
+    "conversationType": "group",
+    "status": "delivered",
+    "deliveredTo": [
+      {
+        "user": {
+          "id": "64f123abc456def789012346",
+          "username": "bob",
+          "displayName": "Bob",
+          "avatarUrl": null
+        },
+        "at": "2025-10-14T12:01:03.000Z"
+      },
+      {
+        "user": {
+          "id": "64f123abc456def789012349",
+          "username": "carol",
+          "displayName": "Carol",
+          "avatarUrl": null
+        },
+        "at": "2025-10-14T12:01:05.000Z"
+      }
+    ],
+    "readBy": [
+      {
+        "user": {
+          "id": "64f123abc456def789012346",
+          "username": "bob",
+          "displayName": "Bob",
+          "avatarUrl": null
+        },
+        "at": "2025-10-14T12:02:00.000Z"
+      }
+    ],
+    "pending": [
+      {
+        "id": "64f123abc456def789012350",
+        "username": "dave",
+        "displayName": "Dave",
+        "avatarUrl": null
+      }
+    ],
+    "readReceiptsDisabled": false
+  }
+}
+```
+
+- `deliveredTo` / `readBy` — each entry is `{ user, at }`; `at` is the ISO time the recipient's client received/read the message (`null` for messages stored before receipt times were tracked).
+- `pending` — recipients who have neither received nor read it yet.
+- `status` — the aggregate from your point of view (`sent | delivered | read`), same value as on `MessageDto`.
+
+**Privacy rules**
+
+- **Direct conversation:** the other member's read time is only shown when their `settings.readReceipts` is on. If it is off, `readBy` omits them (their delivery is still shown), `readReceiptsDisabled` is `true`, and the aggregate `status` caps at `delivered` — it never surfaces as `read`. Their read time is never leaked through the delivery entry.
+- **Group conversation:** `readReceipts` is ignored — every member who received/read appears in `deliveredTo` / `readBy` with their time, and `readReceiptsDisabled` is always `false`.
+
+Errors: `403` you are not the sender, `404` unknown message / not a conversation member.
+
 ### GET /conversations/:id/messages (auth required, keyset pagination)
 
 **Query:** `?cursor=<base64url>&limit=30` (cursor/limit optional)
@@ -615,20 +798,81 @@ At least one target is required (`400` otherwise). Unknown targets return `400`/
 
 **Cursor:** base64url-encoded cursor from `_id` (oldest message). Next page uses `cursor` to get messages `< cursor`.
 
-### POST /conversations/:id/attachments (auth required, multipart/form-data)
+### GET /conversations/:id/media (auth required, keyset pagination)
 
-Uploads message media **without** creating a message. Use this to send a **voice note**: record audio in the browser, `POST` it here, then send the returned attachment(s) via the `message:send` socket event.
+Lists the shareable content of one conversation — the "Media, links and docs" tab — so the client can show all photos/videos/documents/links without scanning messages. Newest first, same cursor/`limit` semantics as message listing (`limit` counts messages; each item carries its own attachments).
 
-**Form fields:** `files` (1–10 files, ≤100MB each; images, video, audio or documents), optional `duration` (seconds; applied to audio/video results).
-**Response 201:**
+**Query:** `?type=all|image|video|audio|file|link&cursor=<base64url>&limit=30` (`type` defaults to `all`, `limit` 1–100 default 30). Media kinds match the **attachment** type, so a message with several photos is one item with several attachments; `link` returns messages whose text contains a URL; `all` is their union.
+
+Each item is a `MessageDto` plus `links` (URLs extracted from the message text; `[]` when there are none).
+
+**Response 200:**
 
 ```json
 {
+  "items": [
+    {
+      "id": "64f123abc456def789012350",
+      "conversationId": "64f123abc456def789012347",
+      "content": "Look at these https://example.com/album",
+      "type": "image",
+      "attachments": [
+        {
+          "type": "image",
+          "url": "https://cdn.example.com/photos/1.jpg",
+          "name": "beach.jpg",
+          "size": 184320,
+          "mimeType": "image/jpeg",
+          "width": 1920,
+          "height": 1080
+        }
+      ],
+      "sender": {
+        "id": "64f123abc456def789012345",
+        "username": "alice",
+        "displayName": "Alice",
+        "avatarUrl": null
+      },
+      "status": "read",
+      "editedAt": null,
+      "forwarded": false,
+      "createdAt": "2025-10-14T12:01:00.000Z",
+      "links": ["https://example.com/album"]
+    }
+  ],
+  "nextCursor": null,
+  "hasMore": false
+}
+```
+
+Members only: non-members get `404`.
+
+### Upload message media without sending (auth required)
+
+There is no multipart endpoint on a conversation any more. To attach media — or to send a **voice note** — run the [sign → PUT → confirm](#uploads-direct-to-r2) flow with `scope: 'message'` (requires `conversationId`; ≤100MB; optional `duration` for audio/video), then send the returned `attachment`:
+
+```js
+// 1. POST /uploads/sign
+//    { scope: 'message', conversationId, name: 'voice-note.webm', size, mimeType: 'audio/webm', duration: 7 }
+// 2. PUT the recording to upload.url with the returned Content-Type header
+// 3. POST /uploads/:uploadId/confirm -> { attachment }
+
+socket.emit(
+  'message:send',
+  { conversationId, type: 'audio', attachments: [attachment] },
+  (ack) => ack.ok && console.log(ack.message),
+);
+```
+
+Or over REST with `POST /conversations/:id/messages`:
+
+```json
+{
+  "type": "audio",
   "attachments": [
     {
       "type": "audio",
-      "url": "/uploads/messages/64f123abc456def789012347/64f123abc456def789012345/a1b2.webm",
-      "key": "messages/64f123abc456def789012347/64f123abc456def789012345/a1b2.webm",
+      "url": "https://…",
       "name": "voice-note.webm",
       "size": 20480,
       "mimeType": "audio/webm",
@@ -638,17 +882,7 @@ Uploads message media **without** creating a message. Use this to send a **voice
 }
 ```
 
-Then send the voice message over the socket:
-
-```js
-socket.emit(
-  'message:send',
-  { conversationId, type: 'audio', attachments: [attachment] },
-  (ack) => ack.ok && console.log(ack.message),
-);
-```
-
-Errors: `400` no files, `400` unsupported file type, `404` not a conversation member, `429` too many uploads.
+Errors: `400` unsupported file type or size above the limit at sign time, `400` on confirm when the stored object's size/content-type differs from what was signed, `404` not a conversation member, `429` too many uploads.
 
 ### GET /conversations/:id/presence (auth required)
 
@@ -669,6 +903,62 @@ Live online / last-seen for the conversation's participants (used when a chat op
 ```
 
 Members only: non-members get `404`.
+
+### GET /messages/search?q=<query>&limit=<n>&cursor=<base64url> (auth required)
+
+Searches the messages of **every conversation the caller belongs to** (there is no per-conversation variant), newest first. Each hit is a `MessageDto` plus the `conversation` it came from, so the caller can render the chat title (direct conversations have no name — their `participants` are included).
+
+**Query:** `q` (1–100 chars, required), `limit` (1–50, default 20), `cursor` (optional, same keyset cursor as message listing).
+
+**Matching** ignores case, accents and letter variants, across languages: `أحمد` matches `احمد`, `مَرْحَبًا` matches `مرحبا`, `Straße` matches `strasse`, `café` matches `cafe`, `٢٠٢٤` matches `2024`. Multi-word queries use AND semantics (`hello world` also finds "world, hello!"). Punctuation/emoji-only queries return an empty page. Rate limit: 30/min per user.
+
+**Response 200:**
+
+```json
+{
+  "items": [
+    {
+      "id": "64f123abc456def789012350",
+      "conversationId": "64f123abc456def789012347",
+      "content": "Hello from أحمد",
+      "sender": {
+        "id": "64f123abc456def789012345",
+        "username": "alice",
+        "displayName": "Alice",
+        "avatarUrl": null
+      },
+      "status": "sent",
+      "editedAt": null,
+      "forwarded": false,
+      "createdAt": "2025-10-14T12:01:00.000Z",
+      "conversation": {
+        "id": "64f123abc456def789012347",
+        "type": "direct",
+        "name": null,
+        "avatarUrl": null,
+        "participants": [
+          {
+            "id": "64f123abc456def789012345",
+            "username": "alice",
+            "displayName": "Alice",
+            "avatarUrl": null
+          },
+          {
+            "id": "64f123abc456def789012346",
+            "username": "bob",
+            "displayName": "Bob",
+            "avatarUrl": null
+          }
+        ],
+        "lastMessageAt": "2025-10-14T12:01:00.000Z",
+        "createdAt": "2025-10-13T09:00:00.000Z"
+      }
+    }
+  ],
+  "nextCursor": null,
+  "hasMore": false
+}
+```
 
 ## Socket.IO
 
@@ -708,4 +998,6 @@ Members only: non-members get `404`.
 - Group management (rename / icon / invite) is REST-only; results reach clients through `conversation:updated` (existing members) and `conversation:new` (invitees).
 - `unreadCount` is only returned by `GET /conversations` (per caller). Socket `conversation:new` / `conversation:updated` payloads do not carry it, so clients maintain the badge themselves: increment on `message:new`, reset when the chat opens (`message:read`).
 - Read receipts respect `settings.readReceipts`. Typing/recording/status/presence are not persisted (only `lastSeenAt` is).
-- Attachment `url` may be an absolute URL or an app-relative path (`/uploads/...`).
+- Per-message delivery/read **times** are persisted on the message (`deliveredAt`/`readAt`) and exposed to the sender via `GET /conversations/:id/messages/:messageId/info` (see Messages (REST)). Direct chats honour the reader's `readReceipts`; groups ignore it.
+- Attachment `url` is the absolute R2 public URL. App-relative paths (`/uploads/...`) are still accepted for attachments stored before the move to R2.
+- Socket events never carry file bytes: upload media over the REST [sign → PUT → confirm](#uploads-direct-to-r2) flow first, then pass the confirmed `attachment` objects in `message:send`. `attachments` must be `[]`/omitted together with empty content, or the send is rejected.

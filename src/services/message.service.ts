@@ -16,12 +16,19 @@ import {
 } from './conversation.service.js';
 import { queueNewMessageNotification } from './notification.service.js';
 import { HttpError } from '../middleware/error.middleware.js';
-import type { ConversationDto, MessageDto } from '../types/chat.js';
+import type {
+  ConversationDto,
+  MessageDto,
+  MessageInfoDto,
+  MessageReceiptDto,
+  ParticipantDto,
+} from '../types/chat.js';
 
 export const attachmentSchema = z.object({
   type: z.enum(['image', 'video', 'audio', 'file']),
-  // Either an absolute URL (R2/CDN) or an app-relative path (`/uploads/...`,
-  // used by local disk storage). `z.string().url()` would reject the latter.
+  // Absolute URL in the R2 public bucket. App-relative paths are still accepted
+  // so attachments stored before the move to R2 (`/uploads/...`) keep validating;
+  // new uploads always produce absolute R2 URLs.
   url: z
     .string()
     .refine((value) => value.startsWith('/') || URL.canParse(value), 'Invalid attachment url'),
@@ -116,19 +123,42 @@ interface PopulatedReply {
 }
 
 /**
+ * Recipients whose read must be treated as *not read* when aggregating status.
+ * Set for the other member(s) of a **direct** conversation who disabled read
+ * receipts: their read state is still stored (and used to compute delivery),
+ * but it must never surface to the sender as `read`. Groups ignore the setting,
+ * so this stays empty for them.
+ */
+export interface MessageStatusContext {
+  hiddenReadRecipients?: Iterable<string>;
+}
+
+/**
  * Aggregate per-message status from the sender's perspective:
  * `read` once every recipient has read, `delivered` once every recipient has
  * received, otherwise `sent`. Self/empty conversations read as `read`.
+ *
+ * Recipients in `context.hiddenReadRecipients` (a direct chat peer who turned
+ * read receipts off) are excluded from the read test while still counting as
+ * delivered, so a message they read caps at `delivered` instead of `read`.
  */
-export function computeMessageStatus(message: MessageDocument): MessageStatus {
+export function computeMessageStatus(
+  message: MessageDocument,
+  context?: MessageStatusContext,
+): MessageStatus {
   const recipients = message.recipients ?? [];
   if (recipients.length === 0) {
     return 'read';
   }
+  const hidden = new Set(context?.hiddenReadRecipients ?? []);
   const readTo = new Set(message.readTo.map((id) => id.toString()));
-  const deliveredTo = new Set(message.deliveredTo.map((id) => id.toString()));
+  // A read always implies delivered, even when the read itself is hidden.
+  const deliveredTo = new Set([
+    ...message.deliveredTo.map((id) => id.toString()),
+    ...readTo,
+  ]);
 
-  if (recipients.every((id) => readTo.has(id.toString()))) {
+  if (recipients.every((id) => readTo.has(id.toString()) && !hidden.has(id.toString()))) {
     return 'read';
   }
   if (recipients.every((id) => deliveredTo.has(id.toString()))) {
@@ -137,7 +167,37 @@ export function computeMessageStatus(message: MessageDocument): MessageStatus {
   return 'sent';
 }
 
-export function toMessageDto(message: MessageDocument): MessageDto {
+/**
+ * Ids of a conversation's participants whose read receipts are off. Only direct
+ * conversations honour the setting (groups ignore it), so this is empty for
+ * groups. The caller may appear in the set, but a message's `recipients` never
+ * include its sender, so that has no effect on the aggregate.
+ */
+export async function hiddenReadRecipientIds(
+  conversation: ConversationDocument,
+): Promise<Set<string>> {
+  if (conversation.type !== 'direct') {
+    return new Set();
+  }
+  const participantIds = conversation.participants.map((participant) => participant.toString());
+  if (participantIds.length === 0) {
+    return new Set();
+  }
+  const users = await User.find({ _id: { $in: participantIds } }).select('settings.readReceipts');
+
+  const hidden = new Set<string>();
+  for (const user of users) {
+    if (user.settings?.readReceipts === false) {
+      hidden.add(user.id as string);
+    }
+  }
+  return hidden;
+}
+
+export function toMessageDto(
+  message: MessageDocument,
+  statusContext?: MessageStatusContext,
+): MessageDto {
   const sender = message.sender as unknown as PopulatedSender;
   const attachments = (message.attachments ?? []).map((attachment) => ({
     type: attachment.type,
@@ -198,10 +258,164 @@ export function toMessageDto(message: MessageDocument): MessageDto {
       avatarUrl: sender.avatarUrl ?? null,
     },
     ...(replyTo && { replyTo }),
-    status: computeMessageStatus(message),
+    status: computeMessageStatus(message, statusContext),
     editedAt: message.editedAt ?? null,
     forwarded: message.forwarded ?? false,
     createdAt: message.createdAt,
+  };
+}
+
+/** Inputs for the pure "Message info" projection (no DB access). */
+export interface MessageInfoInput {
+  conversationType: 'direct' | 'group';
+  /** Recipients in display order (participants minus the sender). */
+  recipients: ParticipantDto[];
+  deliveredTo: string[];
+  readTo: string[];
+  deliveredAt?: Map<string, Date> | null;
+  readAt?: Map<string, Date> | null;
+  /** Recipient id -> their `settings.readReceipts` (defaults to true). */
+  readReceipts?: Map<string, boolean> | null;
+}
+
+export interface MessageInfoProjection {
+  deliveredTo: MessageReceiptDto[];
+  readBy: MessageReceiptDto[];
+  pending: ParticipantDto[];
+  readReceiptsDisabled: boolean;
+}
+
+/**
+ * Builds the delivery/read receipt detail for a message from the sender's point
+ * of view. Privacy rules:
+ *
+ * - **Direct** conversations reveal a recipient's read time only when their
+ *   `settings.readReceipts` is on; otherwise they are omitted from `readBy` and
+ *   `readReceiptsDisabled` is set. Delivery is always shown.
+ * - **Group** conversations ignore `readReceipts` entirely and list every member
+ *   in `deliveredTo` / `readBy` with their times.
+ *
+ * A recipient who read is always treated as delivered (read implies delivered),
+ * even if the stored `deliveredTo` array lacks them.
+ */
+export function buildMessageInfo(input: MessageInfoInput): MessageInfoProjection {
+  const isGroup = input.conversationType === 'group';
+  const deliveredSet = new Set(input.deliveredTo);
+  const readSet = new Set(input.readTo);
+  const timeOf = (map: Map<string, Date> | null | undefined, id: string): Date | null =>
+    map?.get(id) ?? null;
+
+  const deliveredTo: MessageReceiptDto[] = [];
+  const readBy: MessageReceiptDto[] = [];
+  const pending: ParticipantDto[] = [];
+  let readReceiptsDisabled = false;
+
+  for (const user of input.recipients) {
+    const id = user.id;
+    const read = readSet.has(id);
+    const delivered = deliveredSet.has(id) || read;
+    // Groups ignore the setting; direct chats honour the reader's privacy.
+    const receiptsOn = isGroup || (input.readReceipts?.get(id) ?? true);
+
+    if (!isGroup && !receiptsOn) {
+      readReceiptsDisabled = true;
+    }
+    // Whether this read may be shown at all (groups always; direct chats only
+    // when the reader allows it). The *time* may still be unknown (legacy data).
+    const revealRead = read && receiptsOn;
+    if (revealRead) {
+      readBy.push({ user, at: timeOf(input.readAt, id) });
+    }
+    if (delivered) {
+      // Fall back to the read time when a pre-timestamp message has no recorded
+      // delivery time — safe because that read time is already being revealed.
+      deliveredTo.push({
+        user,
+        at: timeOf(input.deliveredAt, id) ?? (revealRead ? timeOf(input.readAt, id) : null),
+      });
+    } else {
+      pending.push(user);
+    }
+  }
+
+  return { deliveredTo, readBy, pending, readReceiptsDisabled };
+}
+
+export interface GetMessageInfoInput {
+  conversationId: string;
+  messageId: string;
+  userId: string;
+}
+
+/**
+ * Delivery/read detail for one message. Only the **sender** may view it (like a
+ * messaging app's "Message info" screen); anyone else gets 403. In a direct
+ * conversation the other member's read time is withheld when their
+ * `settings.readReceipts` is off (see `buildMessageInfo`).
+ */
+export async function getMessageInfo(input: GetMessageInfoInput): Promise<MessageInfoDto> {
+  const conversation = await getConversationForMember(input.conversationId, input.userId);
+
+  if (!mongoose.isValidObjectId(input.messageId)) {
+    throw new HttpError(404, 'Message not found');
+  }
+  const message = await Message.findOne({
+    _id: input.messageId,
+    conversation: conversation._id,
+  });
+  if (!message) {
+    throw new HttpError(404, 'Message not found');
+  }
+  if (message.sender.toString() !== input.userId) {
+    throw new HttpError(403, 'Only the sender can view message info');
+  }
+
+  const recipientIds = (message.recipients ?? []).map((id) => id.toString());
+  const users = await User.find({ _id: { $in: recipientIds } }).select(
+    'username displayName avatarUrl settings.readReceipts',
+  );
+  const byId = new Map(users.map((user) => [user.id as string, user]));
+
+  // Keep the recipients order and drop ids whose user no longer exists.
+  const recipients: ParticipantDto[] = [];
+  const readReceipts = new Map<string, boolean>();
+  for (const id of recipientIds) {
+    const user = byId.get(id);
+    if (!user) {
+      continue;
+    }
+    recipients.push({
+      id,
+      username: user.username,
+      displayName: user.displayName ?? null,
+      avatarUrl: user.avatarUrl ?? null,
+    });
+    readReceipts.set(id, user.settings?.readReceipts ?? true);
+  }
+
+  const projection = buildMessageInfo({
+    conversationType: conversation.type,
+    recipients,
+    deliveredTo: (message.deliveredTo ?? []).map((id) => id.toString()),
+    readTo: (message.readTo ?? []).map((id) => id.toString()),
+    deliveredAt: message.deliveredAt ?? null,
+    readAt: message.readAt ?? null,
+    readReceipts,
+  });
+
+  // Keep the aggregate status consistent with the (privacy-filtered) `readBy`:
+  // a direct recipient who disabled read receipts caps its status at delivered.
+  const hiddenReadRecipients =
+    conversation.type === 'direct'
+      ? new Set([...readReceipts].filter(([, receiptsOn]) => !receiptsOn).map(([id]) => id))
+      : new Set<string>();
+
+  return {
+    messageId: message.id as string,
+    conversationId: conversation.id as string,
+    conversationType: conversation.type,
+    status: computeMessageStatus(message, { hiddenReadRecipients }),
+    ...projection,
   };
 }
 
@@ -256,6 +470,7 @@ export async function sendMessage(
   // Anyone already online is delivered immediately; offline recipients are
   // marked delivered when they next connect (see `markPendingDelivered`).
   const deliveredTo = recipientIds.filter((id) => isOnline(id));
+  const deliveredAt = Object.fromEntries(deliveredTo.map((id) => [id, new Date()]));
 
   // Determine message type based on attachments if not explicitly set
   let messageType = input.type ?? 'text';
@@ -281,6 +496,7 @@ export async function sendMessage(
     ...(replyTo && { replyTo }),
     recipients: recipientIds,
     deliveredTo,
+    deliveredAt,
   });
   await message.populate('sender', 'username displayName avatarUrl');
   if (replyTo) {
@@ -371,7 +587,9 @@ export async function editMessage(
   }
 
   return {
-    message: toMessageDto(message),
+    message: toMessageDto(message, {
+      hiddenReadRecipients: await hiddenReadRecipientIds(conversation),
+    }),
     participantIds: conversation.participants.map((participant) => participant.toString()),
   };
 }
@@ -466,6 +684,7 @@ export async function forwardMessage(
     // Forwarding to a DM whose only other member is offline still counts as
     // sent; online recipients are marked delivered immediately, like a send.
     const deliveredTo = recipientIds.filter((id) => isOnline(id));
+    const deliveredAt = Object.fromEntries(deliveredTo.map((id) => [id, new Date()]));
 
     const message = await Message.create({
       conversation: conversation._id,
@@ -476,6 +695,7 @@ export async function forwardMessage(
       forwarded: true,
       recipients: recipientIds,
       deliveredTo,
+      deliveredAt,
     });
     await message.populate('sender', 'username displayName avatarUrl');
 
@@ -522,6 +742,7 @@ export async function listMessages(
   input: { conversationId: string; userId: string } & ListMessagesInput,
 ): Promise<{ items: MessageDto[]; nextCursor: string | null; hasMore: boolean }> {
   const conversation = await getConversationForMember(input.conversationId, input.userId);
+  const hiddenReadRecipients = await hiddenReadRecipientIds(conversation);
 
   // Keyset pagination: `_id` descending. Older pages are fetched with a cursor
   // pointing at the oldest message the client already has.
@@ -542,7 +763,7 @@ export async function listMessages(
   const oldest = page.at(-1);
 
   return {
-    items: page.map(toMessageDto),
+    items: page.map((doc) => toMessageDto(doc, { hiddenReadRecipients })),
     nextCursor: hasMore && oldest ? encodeCursor(oldest.id as string) : null,
     hasMore,
   };
@@ -573,9 +794,19 @@ export async function markPendingDelivered(
     return [];
   }
 
+  const now = new Date();
   await Message.updateMany(
-    { _id: { $in: pending.map((message) => message._id) }, readTo: { $ne: userId } },
-    { $addToSet: { deliveredTo: userId } },
+    // Re-check both guards so a concurrent `message:read` can't be downgraded.
+    {
+      _id: { $in: pending.map((message) => message._id) },
+      deliveredTo: { $ne: userId },
+      readTo: { $ne: userId },
+    },
+    {
+      $addToSet: { deliveredTo: userId },
+      // Record *when* for the "Message info" screen (idempotent `$set`).
+      $set: { [`deliveredAt.${userId}`]: now },
+    },
   );
 
   const pairs = new Map<string, { conversationId: string; senderId: string }>();
@@ -601,9 +832,23 @@ export async function markConversationRead(
     return null;
   }
 
+  const now = new Date();
+  // Mark read (recording when). Split from delivery so an existing delivery
+  // timestamp is never overwritten with the later read time.
   await Message.updateMany(
     { conversation: conversationId, recipients: userId, readTo: { $ne: userId } },
-    { $addToSet: { readTo: userId, deliveredTo: userId } },
+    {
+      $addToSet: { readTo: userId },
+      $set: { [`readAt.${userId}`]: now },
+    },
+  );
+  // Mark delivered for anything not already delivered (e.g. read offline).
+  await Message.updateMany(
+    { conversation: conversationId, recipients: userId, deliveredTo: { $ne: userId } },
+    {
+      $addToSet: { deliveredTo: userId },
+      $set: { [`deliveredAt.${userId}`]: now },
+    },
   );
 
   return participants;

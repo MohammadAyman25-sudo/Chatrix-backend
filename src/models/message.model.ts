@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import type { HydratedDocument, Model, Types } from 'mongoose';
+import { normalizeForSearch } from '../utils/searchText.js';
 
 export type MessageStatus = 'sent' | 'delivered' | 'read';
 export type MessageType = 'text' | 'image' | 'video' | 'audio' | 'file';
@@ -21,6 +22,12 @@ export interface IMessage {
   sender: Types.ObjectId;
   /** Text content - can be empty if only attachments are sent */
   content: string;
+  /**
+   * Normalized copy of `content` for search (see `utils/searchText.ts`):
+   * lowercased, marks stripped, letter variants folded. Maintained by a
+   * `pre('save')` hook; never exposed in a DTO.
+   */
+  contentNormalized: string;
   type: MessageType;
   /** Media/file attachments */
   attachments?: IAttachment[];
@@ -34,6 +41,15 @@ export interface IMessage {
   recipients: Types.ObjectId[];
   deliveredTo: Types.ObjectId[];
   readTo: Types.ObjectId[];
+  /**
+   * Per-recipient delivery time (user id -> when). The `deliveredTo` array stays
+   * the source of truth for status/unread queries; this map only adds *when* for
+   * the "Message info" screen. A timestamp may be missing for messages stored
+   * before this field existed.
+   */
+  deliveredAt: Map<string, Date>;
+  /** Per-recipient read time (user id -> when); see `deliveredAt`. */
+  readAt: Map<string, Date>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -61,6 +77,7 @@ const messageSchema = new mongoose.Schema<IMessage, MessageModel>(
     conversation: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
     sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     content: { type: String, trim: true, maxlength: 4000, default: '' },
+    contentNormalized: { type: String, default: '', select: false },
     type: { type: String, enum: ['text', 'image', 'video', 'audio', 'file'], default: 'text' },
     attachments: { type: [attachmentSchema], default: [] },
     replyTo: { type: mongoose.Schema.Types.ObjectId, ref: 'Message' },
@@ -69,9 +86,22 @@ const messageSchema = new mongoose.Schema<IMessage, MessageModel>(
     recipients: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     deliveredTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     readTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    // Timestamps for the "Message info" screen. Kept as Maps rather than arrays
+    // of subdocuments: `$set` on a dotted map key (`deliveredAt.<id>`) is
+    // idempotent, whereas `$addToSet` on `{ user, at }` subdocuments would add a
+    // duplicate whenever the timestamp differs.
+    deliveredAt: { type: Map, of: Date, default: {} },
+    readAt: { type: Map, of: Date, default: {} },
   },
   { timestamps: true },
 );
+
+// Keep the normalized search text in sync on every write (send, forward, edit).
+// The query side normalizes with the same function, so case, diacritics and
+// letter variants (Arabic أ/ا, German ß, …) never cause a miss.
+messageSchema.pre('save', function updateContentNormalized() {
+  this.contentNormalized = normalizeForSearch(this.content);
+});
 
 // Keyset pagination: newest first, scoped to a conversation.
 messageSchema.index({ conversation: 1, _id: -1 });

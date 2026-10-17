@@ -244,12 +244,13 @@ export async function handleConnection(socket: AppSocket): Promise<void> {
   socket.join(`user:${userId}`);
 
   const cameOnline = registerSocket(userId, socket.id);
-  if (cameOnline) {
-    const contacts = await getContactIds(userId);
-    emitPresence(contacts, { userId, status: 'online', lastSeenAt: null });
-    await handlePendingDeliveries(socket);
-  }
 
+  // Register every listener *before* any awaited work. Clients emit events
+  // (`typing:start`, `recording:start`, sends, …) as soon as they receive
+  // `connect`, and Socket.IO silently drops events that have no listener yet.
+  // The presence/pending-delivery bootstrap below does several DB round-trips;
+  // it used to run first, which made freshly connected clients lose their first
+  // typing/recording events — and a failure there skipped registration entirely.
   socket.on('message:send', (payload, ack) => {
     void handleSendMessage(socket, payload, ack);
   });
@@ -263,19 +264,19 @@ export async function handleConnection(socket: AppSocket): Promise<void> {
   });
 
   socket.on('typing:start', (payload) => {
-    void relayTyping(socket, payload, true);
+    void relayTyping(socket, payload, true).catch(() => undefined);
   });
 
   socket.on('typing:stop', (payload) => {
-    void relayTyping(socket, payload, false);
+    void relayTyping(socket, payload, false).catch(() => undefined);
   });
 
   socket.on('recording:start', (payload) => {
-    void relayRecording(socket, payload, true);
+    void relayRecording(socket, payload, true).catch(() => undefined);
   });
 
   socket.on('recording:stop', (payload) => {
-    void relayRecording(socket, payload, false);
+    void relayRecording(socket, payload, false).catch(() => undefined);
   });
 
   socket.on('message:read', (payload) => {
@@ -291,8 +292,21 @@ export async function handleConnection(socket: AppSocket): Promise<void> {
       const at = new Date();
       // Persist "last seen" so it survives restarts and can be fetched later.
       await touchLastSeen(userId, at).catch(() => undefined);
-      const contacts = await getContactIds(userId);
+      const contacts = await getContactIds(userId).catch(() => []);
       emitPresence(contacts, { userId, status: 'offline', lastSeenAt: at.toISOString() });
     })();
   });
+
+  // Presence/pending-delivery bootstrap. Listeners are already attached, so a
+  // slow or failing database here can no longer break this socket's events.
+  if (!cameOnline) {
+    return;
+  }
+  try {
+    const contacts = await getContactIds(userId);
+    emitPresence(contacts, { userId, status: 'online', lastSeenAt: null });
+    await handlePendingDeliveries(socket);
+  } catch (error) {
+    console.error(`[sockets] failed to announce presence for ${userId}:`, error);
+  }
 }

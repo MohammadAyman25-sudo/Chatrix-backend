@@ -1,10 +1,10 @@
-import { randomUUID } from 'node:crypto';
 import mongoose from 'mongoose';
 import { z } from 'zod';
 import { User } from '../models/user.model.js';
 import type { UserDocument } from '../models/user.model.js';
 import { HttpError } from '../middleware/error.middleware.js';
 import { storage } from './storage.service.js';
+import { normalizeMimeType } from '../utils/media.js';
 import { toPublicUser, toUserSettings } from './auth.service.js';
 import type { PublicProfile, PublicUser, UserSettings } from '../types/chat.js';
 
@@ -38,16 +38,32 @@ const EXTENSION_BY_MIME: Record<string, string> = {
   'image/gif': '.gif',
   'image/svg+xml': '.svg',
   'image/bmp': '.bmp',
+  'image/avif': '.avif',
+  'image/tiff': '.tiff',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'image/x-icon': '.ico',
   'video/mp4': '.mp4',
   'video/webm': '.webm',
   'video/quicktime': '.mov',
   'video/x-msvideo': '.avi',
+  'video/x-matroska': '.mkv',
+  'video/x-ms-wmv': '.wmv',
+  'video/ogg': '.ogv',
   'audio/mpeg': '.mp3',
   'audio/mp4': '.m4a',
   'audio/ogg': '.ogg',
   'audio/wav': '.wav',
   'audio/webm': '.weba',
   'audio/aac': '.aac',
+  'audio/flac': '.flac',
+  'audio/x-flac': '.flac',
+  'audio/m4a': '.m4a',
+  'audio/x-m4a': '.m4a',
+  'audio/opus': '.opus',
+  'audio/x-wav': '.wav',
+  'audio/vnd.wave': '.wav',
+  'audio/amr': '.amr',
   'application/pdf': '.pdf',
   'application/msword': '.doc',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
@@ -55,48 +71,53 @@ const EXTENSION_BY_MIME: Record<string, string> = {
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
   'application/vnd.ms-powerpoint': '.ppt',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'application/vnd.oasis.opendocument.text': '.odt',
+  'application/vnd.oasis.opendocument.spreadsheet': '.ods',
+  'application/vnd.oasis.opendocument.presentation': '.odp',
+  'application/epub+zip': '.epub',
+  'application/rtf': '.rtf',
   'application/zip': '.zip',
   'application/x-zip-compressed': '.zip',
+  'application/gzip': '.gz',
+  'application/x-gzip': '.gz',
+  'application/x-tar': '.tar',
+  'application/x-7z-compressed': '.7z',
+  'application/vnd.rar': '.rar',
+  'application/x-rar-compressed': '.rar',
   'application/json': '.json',
   'text/plain': '.txt',
   'text/csv': '.csv',
-  'application/rtf': '.rtf',
+  'text/markdown': '.md',
 };
 
-export function allowedImageMimeTypes(): string[] {
-  return Object.keys(EXTENSION_BY_MIME);
-}
-
+/**
+ * Extension for an object key. The lookup is normalized, so a declared type
+ * with parameters (`audio/webm;codecs=opus`) still resolves; unknown types
+ * (including `application/octet-stream`) fall back to no extension.
+ */
 export function getFileExtension(mimeType: string): string {
-  return EXTENSION_BY_MIME[mimeType] || '';
+  return EXTENSION_BY_MIME[normalizeMimeType(mimeType)] ?? '';
 }
 
-function avatarKey(userId: string, contentType: string): string {
-  const extension = EXTENSION_BY_MIME[contentType];
-  if (!extension) {
-    throw new HttpError(400, 'Unsupported image type');
-  }
-  return `avatars/${userId}/${randomUUID()}${extension}`;
-}
-
-export async function updateAvatar(
+/**
+ * Points the user's avatar at an object that was uploaded directly to the
+ * bucket through the presigned-upload flow, deleting the previous icon.
+ */
+export async function applyAvatar(
   userId: string,
-  file: { buffer: Buffer; contentType: string },
+  file: { key: string; url: string },
 ): Promise<PublicUser> {
-  const key = avatarKey(userId, file.contentType);
   const user = await User.findById(userId).select('+avatarKey');
   if (!user) {
     throw new HttpError(404, 'User not found');
   }
 
   const previousKey = user.avatarKey;
-  const { url } = await storage.upload({ key, buffer: file.buffer, contentType: file.contentType });
-
-  user.avatarUrl = url;
-  user.avatarKey = key;
+  user.avatarUrl = file.url;
+  user.avatarKey = file.key;
   await user.save();
 
-  if (previousKey && previousKey !== key) {
+  if (previousKey && previousKey !== file.key) {
     await storage.delete(previousKey).catch(() => undefined);
   }
   return toPublicUser(user);

@@ -23,6 +23,10 @@ describe('route authorization', () => {
     await request(app).get('/api/v1/conversations/64f123abc456def789012347/messages').expect(401);
   });
 
+  it('rejects unauthenticated message search', async () => {
+    await request(app).get('/api/v1/messages/search').query({ q: 'hello' }).expect(401);
+  });
+
   it('rejects unauthenticated message sending to a conversation id', async () => {
     await request(app)
       .post('/api/v1/conversations/64f123abc456def789012347/messages')
@@ -34,16 +38,37 @@ describe('route authorization', () => {
     await request(app).get('/api/v1/conversations/64f123abc456def789012347/presence').expect(401);
   });
 
-  it('rejects unauthenticated attachment upload to a conversation id', async () => {
+  it('rejects unauthenticated conversation media listing', async () => {
+    await request(app).get('/api/v1/conversations/64f123abc456def789012347/media').expect(401);
+  });
+
+  it('rejects unauthenticated upload signing', async () => {
     await request(app)
-      .post('/api/v1/conversations/64f123abc456def789012347/attachments')
+      .post('/api/v1/uploads/sign')
+      .send({
+        scope: 'message',
+        conversationId: '64f123abc456def789012347',
+        name: 'a.png',
+        size: 100,
+        mimeType: 'image/png',
+      })
       .expect(401);
+  });
+
+  it('rejects unauthenticated upload confirmation', async () => {
+    await request(app).post('/api/v1/uploads/64f123abc456def789012347/confirm').expect(401);
   });
 
   it('rejects unauthenticated message editing by id', async () => {
     await request(app)
       .patch('/api/v1/conversations/64f123abc456def789012347/messages/64f123abc456def789012348')
       .send({ content: 'edited' })
+      .expect(401);
+  });
+
+  it('rejects unauthenticated message info lookup by id', async () => {
+    await request(app)
+      .get('/api/v1/conversations/64f123abc456def789012347/messages/64f123abc456def789012348/info')
       .expect(401);
   });
 
@@ -61,10 +86,6 @@ describe('route authorization', () => {
       .patch('/api/v1/conversations/64f123abc456def789012347')
       .send({ name: 'New name' })
       .expect(401);
-  });
-
-  it('rejects unauthenticated group icon upload', async () => {
-    await request(app).post('/api/v1/conversations/64f123abc456def789012347/avatar').expect(401);
   });
 
   it('rejects unauthenticated group icon removal', async () => {

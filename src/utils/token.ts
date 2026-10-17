@@ -6,7 +6,10 @@ import { env, isProduction } from '../config/env.js';
 export const ACCESS_COOKIE = 'access_token';
 export const REFRESH_COOKIE = 'refresh_token';
 
-export const REFRESH_COOKIE_PATH = '/api/auth';
+// Scoped to the auth routes so the refresh cookie is not sent with every API
+// request. Must stay a prefix of the mounted route (`API_PREFIX = /api/v1`,
+// refresh at `/api/v1/auth/refresh`) or the browser will never attach it.
+export const REFRESH_COOKIE_PATH = '/api/v1/auth';
 
 export interface TokenPayload {
   sub: string;

@@ -103,6 +103,31 @@ GET {{baseUrl}}/users/search?q=ali
 ### User Profile
 GET {{baseUrl}}/users/64f123abc456def789012346
 
+### Upload Avatar — 1) Sign (direct-to-R2: no multipart; returns upload.url + headers)
+# scope=avatar takes no conversationId. JPEG/PNG/WebP/GIF, <=5MB.
+POST {{baseUrl}}/uploads/sign
+Content-Type: application/json
+
+{
+  "scope": "avatar",
+  "name": "me.jpg",
+  "size": 51200,
+  "mimeType": "image/jpeg"
+}
+
+### Upload Avatar — 2) PUT the file to the presigned URL (paste upload.url from step 1)
+# Send EXACTLY the headers from the sign response — Content-Type is part of the signature.
+PUT PASTE_UPLOAD_URL_FROM_SIGN_RESPONSE
+Content-Type: image/jpeg
+
+< ./me.jpg
+
+### Upload Avatar — 3) Confirm (returns { user }; the previous avatar object is deleted)
+POST {{baseUrl}}/uploads/PASTE_UPLOAD_ID_FROM_SIGN_RESPONSE/confirm
+
+### Delete Avatar
+DELETE {{baseUrl}}/users/me/avatar
+
 ### List Conversations
 # Each item includes `unreadCount` (messages addressed to you that you haven't read).
 GET {{baseUrl}}/conversations
@@ -134,17 +159,27 @@ Content-Type: application/json
   "name": "Weekend Trip"
 }
 
-### Set / Replace Group Icon (group only, any member; multipart field "avatar")
-# JPEG/PNG/WebP/GIF, <=5MB. Returns { conversation } and emits conversation:updated.
-POST {{baseUrl}}/conversations/64f123abc456def789012348/avatar
-Content-Type: multipart/form-data; boundary=----ChatrixBoundary
+### Set / Replace Group Icon — 1) Sign (group only, any member; no multipart)
+# JPEG/PNG/WebP/GIF, <=5MB. Direct-to-R2: the client PUTs to upload.url (step 2).
+POST {{baseUrl}}/uploads/sign
+Content-Type: application/json
 
-------ChatrixBoundary
-Content-Disposition: form-data; name="avatar"; filename="icon.png"
+{
+  "scope": "group-icon",
+  "conversationId": "64f123abc456def789012348",
+  "name": "icon.png",
+  "size": 30500,
+  "mimeType": "image/png"
+}
+
+### Set / Replace Group Icon — 2) PUT the file to the presigned URL (paste upload.url)
+PUT PASTE_UPLOAD_URL_FROM_SIGN_RESPONSE
 Content-Type: image/png
 
 < ./icon.png
-------ChatrixBoundary--
+
+### Set / Replace Group Icon — 3) Confirm (returns { conversation }, emits conversation:updated)
+POST {{baseUrl}}/uploads/PASTE_UPLOAD_ID_FROM_SIGN_RESPONSE/confirm
 
 ### Delete Group Icon
 DELETE {{baseUrl}}/conversations/64f123abc456def789012348/avatar
@@ -164,6 +199,26 @@ Content-Type: application/json
 
 {
   "content": "Hey!"
+}
+
+### Send Message with Attachment (attachment = the `attachment` returned by the upload confirm step)
+# A message needs content or at least one attachment. `type` labels the bubble.
+POST {{baseUrl}}/conversations/64f123abc456def789012347/messages
+Content-Type: application/json
+
+{
+  "type": "image",
+  "content": "Look at this!",
+  "attachments": [
+    {
+      "type": "image",
+      "url": "https://pub-example.r2.dev/messages/64f123abc456def789012347/64f123abc456def789012345/a1b2.png",
+      "key": "messages/64f123abc456def789012347/64f123abc456def789012345/a1b2.png",
+      "name": "holiday.png",
+      "size": 348122,
+      "mimeType": "image/png"
+    }
+  ]
 }
 
 ### Reply Privately (DM to the quoted message's author)
@@ -197,21 +252,30 @@ Content-Type: application/json
   "userIds": ["64f123abc456def789012351"]
 }
 
-### Upload Voice Note / Attachments (returns attachments; then send via socket message:send)
-# multipart/form-data: field "files" (1-10), optional "duration" (seconds)
-POST {{baseUrl}}/conversations/64f123abc456def789012347/attachments
-Content-Type: multipart/form-data; boundary=----ChatrixBoundary
+### Upload Voice Note / Attachment — 1) Sign (no multipart; direct-to-R2)
+# scope=message requires conversationId; <=100MB; `duration` (seconds) optional for audio/video.
+# The client then PUTs the recorded bytes to upload.url (step 2).
+POST {{baseUrl}}/uploads/sign
+Content-Type: application/json
 
-------ChatrixBoundary
-Content-Disposition: form-data; name="duration"
+{
+  "scope": "message",
+  "conversationId": "64f123abc456def789012347",
+  "name": "voice-note.webm",
+  "size": 20480,
+  "mimeType": "audio/webm",
+  "duration": 7
+}
 
-7
-------ChatrixBoundary
-Content-Disposition: form-data; name="files"; filename="voice-note.webm"
+### Upload Voice Note / Attachment — 2) PUT the recording to the presigned URL (paste upload.url)
+PUT PASTE_UPLOAD_URL_FROM_SIGN_RESPONSE
 Content-Type: audio/webm
 
 < ./voice-note.webm
-------ChatrixBoundary--
+
+### Upload Voice Note / Attachment — 3) Confirm (returns { attachment })
+# Then send the attachment with message:send (socket) or the message POST above.
+POST {{baseUrl}}/uploads/PASTE_UPLOAD_ID_FROM_SIGN_RESPONSE/confirm
 
 ### Conversation Presence (online / last seen)
 GET {{baseUrl}}/conversations/64f123abc456def789012347/presence
@@ -221,3 +285,46 @@ GET {{baseUrl}}/conversations/64f123abc456def789012347/messages
 
 ### List Messages with Cursor
 GET {{baseUrl}}/conversations/64f123abc456def789012347/messages?cursor=CURSOR&limit=30
+
+### Message Info (delivery/read receipts for your own message; sender only)
+# info.deliveredTo / info.readBy = [{ user, at }]; info.pending = not-yet-received.
+# Direct chats hide the other member's read time when their readReceipts is off
+# (then readReceiptsDisabled = true and they only appear under deliveredTo).
+# Groups ignore readReceipts and show every member. `at` is null for old messages.
+GET {{baseUrl}}/conversations/64f123abc456def789012347/messages/64f123abc456def789012350/info
+
+### Search Messages (across all your conversations)
+# Normalization-based matching: ignores case, accents and letter variants
+# (أ/ا, ة/ه, ß/ss, café/cafe, ٢٠٢٤/2024). Multi-word = every word must appear.
+# Returns { items, nextCursor, hasMore }; each hit is a MessageDto + its conversation.
+GET {{baseUrl}}/messages/search?q=hello
+
+### Search Messages — Arabic letter variants (أ = ا, harakat ignored)
+# This query is "احمد"; messages with "أحمد" or "أَحْمَد" match too.
+GET {{baseUrl}}/messages/search?q=%D8%A7%D8%AD%D9%85%D8%AF
+
+### Search Messages with Cursor (older hits)
+GET {{baseUrl}}/messages/search?q=hello&limit=20&cursor=CURSOR
+
+### List Conversation Media — photos, videos, voice notes, docs and links
+# type: all (default) | image | video | audio | file | link
+# Returns { items, nextCursor, hasMore }; each item is a MessageDto + `links`.
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media
+
+### List Photos Only
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media?type=image
+
+### List Videos Only
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media?type=video
+
+### List Voice Notes Only
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media?type=audio
+
+### List Documents Only
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media?type=file
+
+### List Links Only
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media?type=link
+
+### List Media with Cursor (older items)
+GET {{baseUrl}}/conversations/64f123abc456def789012347/media?type=image&limit=30&cursor=CURSOR

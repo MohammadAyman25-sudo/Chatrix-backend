@@ -109,3 +109,60 @@ export interface MessageDto {
   forwarded: boolean;
   createdAt: Date;
 }
+
+/**
+ * One recipient's delivery or read receipt for the "Message info" screen.
+ * `at` is null for messages stored before receipt timestamps existed.
+ */
+export interface MessageReceiptDto {
+  user: ParticipantDto;
+  at: Date | null;
+}
+
+/**
+ * Per-message delivery/read detail for its **sender** (`GET
+ * /conversations/:id/messages/:messageId/info`). In a **direct** conversation a
+ * recipient's read time is only revealed when their `settings.readReceipts` is
+ * on (`readReceiptsDisabled` flags that it is off); in a **group** the setting
+ * is ignored and every member's delivery/read times are shown.
+ */
+export interface MessageInfoDto {
+  messageId: string;
+  conversationId: string;
+  conversationType: ConversationType;
+  /** Aggregate status from the sender's perspective. */
+  status: MessageStatus;
+  /** Recipients the message has reached, with the delivery time. */
+  deliveredTo: MessageReceiptDto[];
+  /**
+   * Recipients who read the message, with the read time. In a direct chat this
+   * omits the other member when they have read receipts disabled.
+   */
+  readBy: MessageReceiptDto[];
+  /** Recipients who have neither received nor read the message yet. */
+  pending: ParticipantDto[];
+  /**
+   * Direct conversations only: true when the other member has read receipts
+   * turned off, so their read time is intentionally withheld. Always false for
+   * groups, where receipts are always shown.
+   */
+  readReceiptsDisabled: boolean;
+}
+
+/**
+ * A message returned by `GET /messages/search`, together with the conversation
+ * it belongs to so the client can render the chat title (a direct conversation
+ * has no name, hence the full participant list).
+ */
+export interface MessageSearchHit extends MessageDto {
+  conversation: ConversationDto;
+}
+
+/**
+ * A message returned by the conversation media listing (`GET
+ * /conversations/:id/media`): the message plus the URLs found in its content
+ * (`[]` when it has none), so a "links" tab needs no client-side parsing.
+ */
+export interface ConversationMediaItem extends MessageDto {
+  links: string[];
+}

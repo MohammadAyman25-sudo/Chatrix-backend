@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import mongoose from 'mongoose';
 import { z } from 'zod';
 import { Conversation } from '../models/conversation.model.js';
@@ -6,7 +5,6 @@ import type { ConversationDocument } from '../models/conversation.model.js';
 import { Message } from '../models/message.model.js';
 import { User } from '../models/user.model.js';
 import { HttpError } from '../middleware/error.middleware.js';
-import { getFileExtension } from './user.service.js';
 import { storage } from './storage.service.js';
 import type { ConversationDto, ParticipantDto } from '../types/chat.js';
 
@@ -293,27 +291,20 @@ export async function updateGroupName(
   return populatedDto(conversation);
 }
 
-/** Sets or replaces a group's icon, deleting the previous object. */
-export async function updateGroupAvatar(
+/** Points a group at an icon uploaded directly to the bucket; deletes the previous one. */
+export async function applyGroupAvatar(
   userId: string,
   conversationId: string,
-  file: { buffer: Buffer; contentType: string },
+  file: { key: string; url: string },
 ): Promise<ConversationDto> {
-  const extension = getFileExtension(file.contentType);
-  if (!extension) {
-    throw new HttpError(400, 'Unsupported image type');
-  }
-
   const conversation = await getGroupForMember(conversationId, userId, { withAvatarKey: true });
   const previousKey = conversation.avatarKey;
-  const key = `conversations/${conversation.id}/icon/${randomUUID()}${extension}`;
-  const { url } = await storage.upload({ key, buffer: file.buffer, contentType: file.contentType });
 
-  conversation.avatarUrl = url;
-  conversation.avatarKey = key;
+  conversation.avatarUrl = file.url;
+  conversation.avatarKey = file.key;
   await conversation.save();
 
-  if (previousKey && previousKey !== key) {
+  if (previousKey && previousKey !== file.key) {
     await storage.delete(previousKey).catch(() => undefined);
   }
   return populatedDto(conversation);

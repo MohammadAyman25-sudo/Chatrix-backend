@@ -7,7 +7,6 @@ import {
   removeAvatar,
   searchUsers,
   searchUsersSchema,
-  updateAvatar,
   updateProfile,
   updateProfileSchema,
   updateSettings,
@@ -53,19 +52,6 @@ export async function updateSettingsHandler(req: Request, res: Response): Promis
   const input = updateSettingsSchema.parse(req.body);
   const settings = await updateSettings(requireUserId(req), input);
   res.json({ settings });
-}
-
-export async function uploadAvatarHandler(req: Request, res: Response): Promise<void> {
-  const userId = requireUserId(req);
-  if (!req.file) {
-    throw new HttpError(400, 'No avatar file provided (expected multipart field "avatar")');
-  }
-
-  const user = await updateAvatar(userId, {
-    buffer: req.file.buffer,
-    contentType: req.file.mimetype,
-  });
-  res.json({ user });
 }
 
 export async function deleteAvatarHandler(req: Request, res: Response): Promise<void> {

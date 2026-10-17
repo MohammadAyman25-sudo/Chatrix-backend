@@ -8,7 +8,6 @@ import {
   getParticipantIdsForMember,
   listConversations,
   removeGroupAvatar,
-  updateGroupAvatar,
   updateGroupName,
   updateGroupSchema,
 } from '../services/conversation.service.js';
@@ -60,22 +59,6 @@ export async function updateGroupHandler(req: Request, res: Response): Promise<v
   const userId = requireUserId(req);
   const input = updateGroupSchema.parse(req.body);
   const conversation = await updateGroupName(userId, routeParam(req.params.conversationId), input);
-
-  broadcastConversationUpdate(conversation, userId);
-  res.json({ conversation });
-}
-
-/** Sets or replaces a group icon (any member). Multipart field `avatar`. */
-export async function updateGroupAvatarHandler(req: Request, res: Response): Promise<void> {
-  const userId = requireUserId(req);
-  if (!req.file) {
-    throw new HttpError(400, 'No icon file provided (expected multipart field "avatar")');
-  }
-
-  const conversation = await updateGroupAvatar(userId, routeParam(req.params.conversationId), {
-    buffer: req.file.buffer,
-    contentType: req.file.mimetype,
-  });
 
   broadcastConversationUpdate(conversation, userId);
   res.json({ conversation });
