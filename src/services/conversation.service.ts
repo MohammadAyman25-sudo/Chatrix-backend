@@ -64,10 +64,40 @@ export function toConversationDto(conversation: ConversationDocument): Conversat
     type: conversation.type,
     name: conversation.name ?? null,
     avatarUrl: conversation.avatarUrl ?? null,
+    ownerId: effectiveGroupOwner(conversation),
     participants: participants.map(toParticipantDto),
     lastMessageAt: conversation.lastMessageAt ?? null,
     createdAt: conversation.createdAt,
   };
+}
+
+/**
+ * The one member allowed to manage group membership (currently: remove
+ * others). Groups created before the `owner` field existed fall back to their
+ * first participant — `createConversation` always puts the creator first, and
+ * only the owner can remove members, so that first slot is stable. Direct
+ * conversations have no owner.
+ */
+export function effectiveGroupOwner(conversation: {
+  type: string;
+  owner?: unknown;
+  participants: unknown[];
+}): string | null {
+  if (conversation.type !== 'group') {
+    return null;
+  }
+  if (conversation.owner) {
+    return String(conversation.owner);
+  }
+  const first = conversation.participants[0];
+  if (first == null) {
+    return null;
+  }
+  // Raw ids stringify directly; a populated participant doc keeps the id on `_id`.
+  if (typeof first === 'object' && '_id' in first) {
+    return String((first as { _id: unknown })._id);
+  }
+  return String(first);
 }
 
 function directKeyFor(userIds: string[]): string {
@@ -157,6 +187,7 @@ export async function createConversation(
       type: 'group',
       participants: participantIds,
       name: input.name,
+      owner: userId,
     });
     created = true;
   }
@@ -360,4 +391,40 @@ export async function removeGroupAvatar(
     await storage.delete(previousKey).catch(() => undefined);
   }
   return populatedDto(conversation);
+}
+
+/**
+ * Removes a member from a group. Only the group owner may remove anyone, and
+ * the owner cannot be removed (ownership is not transferable). Messages the
+ * removed member sent stay in the chat — they simply lose access, because
+ * membership is what scopes message reads. Returns the updated conversation
+ * plus the removed id, so the caller can emit `conversation:removed` to them
+ * and `conversation:updated` to the remaining members.
+ */
+export async function removeGroupParticipant(
+  userId: string,
+  conversationId: string,
+  targetUserId: string,
+): Promise<{ conversation: ConversationDto; removedId: string }> {
+  if (!mongoose.isValidObjectId(targetUserId)) {
+    throw new HttpError(400, 'Invalid participant id');
+  }
+  const group = await getGroupForMember(conversationId, userId);
+
+  if (effectiveGroupOwner(group) !== userId) {
+    throw new HttpError(403, 'Only the group owner can remove members');
+  }
+  if (targetUserId === userId) {
+    throw new HttpError(400, 'The group owner cannot be removed');
+  }
+  if (!group.participants.some((participant) => participant.toString() === targetUserId)) {
+    throw new HttpError(400, 'User is not a member of this group');
+  }
+
+  group.participants = group.participants.filter(
+    (participant) => participant.toString() !== targetUserId,
+  );
+  await group.save();
+
+  return { conversation: await populatedDto(group), removedId: targetUserId };
 }

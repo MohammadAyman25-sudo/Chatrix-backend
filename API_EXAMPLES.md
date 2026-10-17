@@ -398,6 +398,7 @@ Public profile of another user. Returns the same shape as a search result.
       "type": "direct",
       "name": null,
       "avatarUrl": null,
+      "ownerId": null,
       "participants": [
         {
           "id": "64f123abc456def789012345",
@@ -421,6 +422,7 @@ Public profile of another user. Returns the same shape as a search result.
       "type": "group",
       "name": "Team Chat",
       "avatarUrl": "https://pub-example.r2.dev/conversations/64f123abc456def789012348/icon/a1b2.png",
+      "ownerId": "64f123abc456def789012345",
       "participants": [
         {
           "id": "64f123abc456def789012345",
@@ -450,6 +452,8 @@ Public profile of another user. Returns the same shape as a search result.
 ```
 
 `unreadCount` is the number of messages **addressed to the requesting user** in that conversation that they have not marked read yet (own messages never count). It is computed for the caller, so two users see different counts. `GET /conversations` is the only place it is returned; realtime `conversation:new` / `conversation:updated` payloads omit it, so clients keep the count locally (increment on `message:new`, reset to `0` when the chat is opened and `message:read` is sent).
+
+`ownerId` is the **group owner** — the only member allowed to remove others (see [DELETE /conversations/:id/participants/:participantId](#delete-conversationsidparticipantsparticipantid-auth-required)). It is set to the creator; groups created before ownership was stored fall back to their first participant. Always `null` for direct conversations.
 
 ### POST /conversations (auth required)
 
@@ -562,6 +566,30 @@ Invite users to a **group** (any member may). Ids already in the group are ignor
 
 ```json
 { "message": "Everyone you selected is already in this group" }
+```
+
+### DELETE /conversations/:id/participants/:participantId (auth required)
+
+Remove a member from a **group** ("kick") — **only the group owner may** (any other member gets `403`; non-members `404`; direct conversations `400`). The owner is the `ownerId` on the conversation: set to the creator at group creation, with groups created before ownership was stored falling back to their first participant.
+
+The removed user keeps the messages they sent but **loses all access** to the chat (membership is what scopes message reads), and receives `conversation:removed` `{ conversationId }` so their client drops it immediately; the remaining members receive `conversation:updated` with the smaller participant list. The owner cannot be removed (`400` — ownership is not transferable), and the target must currently be a member (`400`).
+
+**Response 200:**
+
+```json
+{ "conversation": { ...ConversationDto without the removed participant... } }
+```
+
+**Response 403 (you are not the owner):**
+
+```json
+{ "message": "Only the group owner can remove members" }
+```
+
+**Response 400 (owner removed / not a member):**
+
+```json
+{ "message": "The group owner cannot be removed" }
 ```
 
 ## Messages (REST)
@@ -936,6 +964,7 @@ Searches the messages of **every conversation the caller belongs to** (there is 
         "type": "direct",
         "name": null,
         "avatarUrl": null,
+        "ownerId": null,
         "participants": [
           {
             "id": "64f123abc456def789012345",
@@ -982,7 +1011,8 @@ Searches the messages of **every conversation the caller belongs to** (there is 
 - `message:new` (payload: `MessageDto`)
 - `message:edited` (payload: `MessageDto` — same message with updated `content`/`editedAt`)
 - `conversation:new` (payload: `ConversationDto` — also fires when a private reply creates a DM)
-- `conversation:updated` (payload: `ConversationDto` — group renamed, icon changed, or participants invited)
+- `conversation:updated` (payload: `ConversationDto` — group renamed, icon changed, participants invited, or a member removed by the owner)
+- `conversation:removed` (payload: `{ conversationId }` — sent to a member the group owner removed; drop the chat)
 - `typing:update` (payload: `{ conversationId, userId, isTyping }`)
 - `recording:update` (payload: `{ conversationId, userId, isRecording }`)
 - `message:status` (payload: `{ conversationId, userId, status: 'delivered'|'read', at: string }`)
@@ -995,7 +1025,7 @@ Searches the messages of **every conversation the caller belongs to** (there is 
 - `message:send` REST and socket both call `message.service.sendMessage` and broadcast `message:new` to others (sender gets ack from socket or 201 from REST). With `replyPrivately`, both also return/broadcast the resulting `conversation` when a new DM is created.
 - `message:edit` REST and socket both call `message.service.editMessage`; the editor gets the updated message via ack/response, others via `message:edited`. Only the sender, only text messages, only within 15 minutes.
 - `message:forward` REST and socket both call `message.service.forwardMessage`; each target chat gets a `message:new` (with `forwarded: true`) and the sender gets the copies via ack/response. A direct chat created for a `userId` target is announced with `conversation:new` before its message. Forwarding is throttled per user.
-- Group management (rename / icon / invite) is REST-only; results reach clients through `conversation:updated` (existing members) and `conversation:new` (invitees).
+- Group management (rename / icon / invite / kick) is REST-only; results reach clients through `conversation:updated` (existing members), `conversation:new` (invitees) and `conversation:removed` (a member kicked by the owner).
 - `unreadCount` is only returned by `GET /conversations` (per caller). Socket `conversation:new` / `conversation:updated` payloads do not carry it, so clients maintain the badge themselves: increment on `message:new`, reset when the chat opens (`message:read`).
 - Read receipts respect `settings.readReceipts`. Typing/recording/status/presence are not persisted (only `lastSeenAt` is).
 - Per-message delivery/read **times** are persisted on the message (`deliveredAt`/`readAt`) and exposed to the sender via `GET /conversations/:id/messages/:messageId/info` (see Messages (REST)). Direct chats honour the reader's `readReceipts`; groups ignore it.

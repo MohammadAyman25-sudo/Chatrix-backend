@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   addGroupMembersSchema,
+  effectiveGroupOwner,
   toUnreadCountMap,
   updateGroupSchema,
 } from './conversation.service.js';
@@ -72,5 +73,40 @@ describe('toUnreadCountMap', () => {
 
   it('is empty when there are no rows', () => {
     expect(toUnreadCountMap([]).size).toBe(0);
+  });
+});
+
+describe('effectiveGroupOwner', () => {
+  it('returns the stored owner for a group', () => {
+    expect(
+      effectiveGroupOwner({
+        type: 'group',
+        owner: 'owner-1',
+        participants: ['owner-1', 'member-2'],
+      }),
+    ).toBe('owner-1');
+  });
+
+  it('falls back to the first participant for legacy groups without an owner', () => {
+    expect(
+      effectiveGroupOwner({ type: 'group', participants: ['creator', 'member-2', 'member-3'] }),
+    ).toBe('creator');
+  });
+
+  it('resolves populated participant docs in the legacy fallback', () => {
+    expect(
+      effectiveGroupOwner({
+        type: 'group',
+        participants: [{ _id: 'creator' }, { _id: 'member-2' }],
+      }),
+    ).toBe('creator');
+  });
+
+  it('is null for direct conversations, even with participants', () => {
+    expect(effectiveGroupOwner({ type: 'direct', participants: ['a', 'b'] })).toBeNull();
+  });
+
+  it('is null when a group has no participants', () => {
+    expect(effectiveGroupOwner({ type: 'group', participants: [] })).toBeNull();
   });
 });

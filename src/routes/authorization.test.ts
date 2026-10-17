@@ -98,4 +98,12 @@ describe('route authorization', () => {
       .send({ participantIds: ['64f123abc456def789012349'] })
       .expect(401);
   });
+
+  it('rejects unauthenticated group member removal', async () => {
+    await request(app)
+      .delete(
+        '/api/v1/conversations/64f123abc456def789012347/participants/64f123abc456def789012349',
+      )
+      .expect(401);
+  });
 });

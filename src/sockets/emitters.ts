@@ -43,6 +43,11 @@ export function emitConversationUpdated(
   getIO()?.to(roomsFor(participantIds, exceptUserId)).emit('conversation:updated', conversation);
 }
 
+/** Tells a removed member to drop a conversation from their client. */
+export function emitConversationRemoved(conversationId: string, userId: string): void {
+  getIO()?.to(`user:${userId}`).emit('conversation:removed', { conversationId });
+}
+
 /**
  * Broadcasts the result of a forward: any newly created direct conversations
  * first (so recipients can resolve the chat), then one `message:new` per target

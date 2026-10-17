@@ -8,11 +8,16 @@ import {
   getParticipantIdsForMember,
   listConversations,
   removeGroupAvatar,
+  removeGroupParticipant,
   updateGroupName,
   updateGroupSchema,
 } from '../services/conversation.service.js';
 import { getPresenceForUsers } from '../services/presence.service.js';
-import { emitConversationNew, emitConversationUpdated } from '../sockets/emitters.js';
+import {
+  emitConversationNew,
+  emitConversationRemoved,
+  emitConversationUpdated,
+} from '../sockets/emitters.js';
 import { routeParam } from '../utils/routeParam.js';
 
 function requireUserId(req: Request): string {
@@ -92,6 +97,28 @@ export async function addGroupParticipantsHandler(req: Request, res: Response): 
 
   emitConversationUpdated(existingIds, conversation, userId);
   emitConversationNew(addedIds, conversation, userId);
+  res.json({ conversation });
+}
+
+/**
+ * Removes a member from a group (owner only). The removed user gets
+ * `conversation:removed` (drop the chat); the remaining members get
+ * `conversation:updated` (smaller participant list).
+ */
+export async function removeGroupParticipantHandler(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req);
+  const { conversation, removedId } = await removeGroupParticipant(
+    userId,
+    routeParam(req.params.conversationId),
+    routeParam(req.params.participantId),
+  );
+
+  emitConversationRemoved(removedId, conversation.id);
+  emitConversationUpdated(
+    conversation.participants.map((participant) => participant.id),
+    conversation,
+    userId,
+  );
   res.json({ conversation });
 }
 

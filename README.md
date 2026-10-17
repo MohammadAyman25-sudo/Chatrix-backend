@@ -42,7 +42,7 @@ A real-time chat backend: REST API + Socket.IO, JWT cookie authentication, Mongo
 - **Authentication** — email/password registration and login with JWT access + refresh tokens stored in **httpOnly cookies** (never `localStorage`).
 - **Email verification** — accounts are created unverified with a single-use, hashed, expiring token; login is blocked until the emailed link is redeemed. Optional via `EMAIL_VERIFICATION_ENABLED`.
 - **Password security** — policy (8–72 chars, upper/lower/digit/symbol) enforced with `confirmPassword`, plus a bundled common-password list and a Have I Been Pwned k-anonymity check for breached passwords.
-- **Direct & group conversations** — idempotent direct chats (deduplicated by a unique key), group name/icon management and member invitations. New members can read the full history.
+- **Direct & group conversations** — idempotent direct chats (deduplicated by a unique key), group name/icon management, member invitations and **owner-only member removal** (the group owner can kick anyone but themselves). New members can read the full history.
 - **Real-time messaging over Socket.IO** — send, edit (15-minute window), forward to chats or users, reply and _reply privately_ (auto-creates a DM with the quoted author).
 - **Direct-to-R2 uploads** — attachments, voice notes, avatars and group icons go **straight from the client to Cloudflare R2** through presigned `PUT` URLs (`sign` → upload → `confirm`); the API never receives file bytes and no multipart handling exists.
 - **Message status** — `sent → delivered → read` tracking with per-user read receipts. `GET /conversations/:id/messages/:messageId/info` tells the sender who received/read a message and when (direct chats honour the reader's `readReceipts` setting; groups always show every member).
@@ -105,7 +105,7 @@ Email delivery and orphaned-upload cleanup never run inside a request. `services
 Five collections carry the whole system (see `src/models/`):
 
 - **`User`** — `username` (unique) and `email` (unique) with a bcrypt-hashed `password`, optional `displayName`/`bio`/`avatarUrl` plus `avatarKey` (the R2 object key, `select: false`), email-verification fields (`emailVerifiedAt`, the **sha256** of the outstanding token and its expiry — both `select: false`, so a database leak exposes no usable links), `lastSeenAt`, and a `settings` subdocument (`theme: 'light' | 'dark' | 'system'`, `notifications`, `readReceipts`; `_id: false`).
-- **`Conversation`** — `type: 'direct' | 'group'`, `participants[]`, group-only `name`/`avatarUrl`/`avatarKey`, `directKey` (the sorted participant ids joined with `:` — **unique**, which is what makes direct-chat creation idempotent and deduplicated), and `lastMessage`/`lastMessageAt` for list previews.
+- **`Conversation`** — `type: 'direct' | 'group'`, `participants[]`, group-only `name`/`avatarUrl`/`avatarKey` and `owner` (the creator — the only member allowed to remove others; groups predating the field fall back to their first participant), `directKey` (the sorted participant ids joined with `:` — **unique**, which is what makes direct-chat creation idempotent and deduplicated), and `lastMessage`/`lastMessageAt` for list previews.
 - **`Message`** — `conversation`, `sender`, `content` plus `contentNormalized` (a lowercased, mark-stripped, letter-variant-folded search copy maintained by a `pre('save')` hook and backfilled on boot — see [Search](#search)), `type: 'text' | 'image' | 'video' | 'audio' | 'file'`, `attachments[]` (`type`/`url`/`key`/`name`/`size`/`mimeType`/`width?`/`height?`/`duration?`), `replyTo`, `forwarded`, `editedAt?`, and the receipt bookkeeping: `recipients[]` (participants minus the sender), `deliveredTo[]`, `readTo[]`, and `deliveredAt`/`readAt` maps (recipient id → timestamp) powering per-message read receipts.
 - **`Upload`** — one row per direct upload: `user`, `scope: 'message' | 'avatar' | 'group-icon'`, `conversation?` (null for avatars), a **unique** `key` (the R2 object key), declared `name`/`mimeType`/`size`, `actualSize?`, `duration?`, and `status: 'pending' | 'confirmed'`.
 - **`Job`** — durable background work: `type`, a JSON-serializable `payload`, `status: 'pending' | 'running' | 'completed' | 'failed'`, `attempts`, `runAt` (retry backoff), `lockedAt?`, optional `dedupeKey`, `lastError?`.
@@ -305,6 +305,7 @@ All routes are mounted under `/api/v1`. Authentication uses the `access_token` h
 | `PATCH`  | `/api/v1/conversations/:id`                             | Rename a group.                                       |  ✓   |
 | `DELETE` | `/api/v1/conversations/:id/avatar`                      | Remove a group icon.                                  |  ✓   |
 | `POST`   | `/api/v1/conversations/:id/participants`                | Invite users to a group.                              |  ✓   |
+| `DELETE` | `/api/v1/conversations/:id/participants/:participantId` | Remove a group member (owner only).                   |  ✓   |
 | `GET`    | `/api/v1/conversations/:id/presence`                    | Online/last-seen for participants.                    |  ✓   |
 | `GET`    | `/api/v1/conversations/:id/messages`                    | List messages (keyset pagination).                    |  ✓   |
 | `GET`    | `/api/v1/conversations/:id/media`                       | Media, links and documents shared in a conversation.  |  ✓   |
@@ -343,6 +344,7 @@ Connect to the same origin; the server reads the `access_token` cookie during th
 | `message:edited`       | `MessageDto`                                                    |
 | `conversation:new`     | `ConversationDto`                                               |
 | `conversation:updated` | `ConversationDto`                                               |
+| `conversation:removed` | `{ conversationId }` (sent to a kicked member)                  |
 | `typing:update`        | `{ conversationId, userId, isTyping }`                          |
 | `recording:update`     | `{ conversationId, userId, isRecording }`                       |
 | `message:status`       | `{ conversationId, userId, status: 'delivered' \| 'read', at }` |

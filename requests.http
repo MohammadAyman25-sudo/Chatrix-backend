@@ -193,6 +193,14 @@ Content-Type: application/json
   "participantIds": ["64f123abc456def789012350"]
 }
 
+### Remove Group Member / Kick (group only, OWNER only)
+# Only the group owner (Conversation.owner = the creator; legacy groups fall back
+# to their first participant, see ownerId on the conversation) may remove someone.
+# The removed user keeps their messages but loses access, gets conversation:removed
+# and their client should drop the chat; remaining members get conversation:updated.
+# 403 if you are not the owner; the owner cannot be removed (400).
+DELETE {{baseUrl}}/conversations/64f123abc456def789012348/participants/64f123abc456def789012350
+
 ### Send Message
 POST {{baseUrl}}/conversations/64f123abc456def789012347/messages
 Content-Type: application/json

@@ -6,6 +6,7 @@ import {
   deleteGroupAvatarHandler,
   getConversationPresenceHandler,
   listConversationsHandler,
+  removeGroupParticipantHandler,
   updateGroupHandler,
 } from '../controllers/conversation.controller.js';
 import {
@@ -29,6 +30,11 @@ conversationRouter.patch('/:conversationId', updateGroupHandler);
 conversationRouter.delete('/:conversationId/avatar', deleteGroupAvatarHandler);
 // Invite users to a group (any member may invite).
 conversationRouter.post('/:conversationId/participants', addGroupParticipantsHandler);
+// Remove a member from a group (only the group owner may).
+conversationRouter.delete(
+  '/:conversationId/participants/:participantId',
+  removeGroupParticipantHandler,
+);
 conversationRouter.get('/:conversationId/presence', getConversationPresenceHandler);
 // Media, links and documents shared in the conversation.
 conversationRouter.get('/:conversationId/media', listConversationMediaHandler);

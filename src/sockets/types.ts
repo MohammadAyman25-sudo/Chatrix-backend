@@ -77,6 +77,14 @@ export interface ConversationPayload {
   conversationId: string;
 }
 
+/**
+ * Sent to a user the group owner removed from a group, so their client can
+ * drop the chat immediately (they can no longer read its messages).
+ */
+export interface ConversationRemovedPayload {
+  conversationId: string;
+}
+
 export interface TypingUpdatePayload {
   conversationId: string;
   userId: string;
@@ -123,6 +131,7 @@ export interface ServerToClientEvents {
   'message:edited': (message: MessageDto) => void;
   'conversation:new': (conversation: ConversationDto) => void;
   'conversation:updated': (conversation: ConversationDto) => void;
+  'conversation:removed': (payload: ConversationRemovedPayload) => void;
   'typing:update': (payload: TypingUpdatePayload) => void;
   'recording:update': (payload: RecordingUpdatePayload) => void;
   'message:status': (payload: MessageStatusPayload) => void;

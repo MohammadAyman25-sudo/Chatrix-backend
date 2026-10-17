@@ -62,6 +62,12 @@ export interface ConversationDto {
   name: string | null;
   /** Group icon; always null for direct conversations (use participant avatars). */
   avatarUrl: string | null;
+  /**
+   * The group owner — the only member allowed to remove others. Always null
+   * for direct conversations. Groups created before ownership was stored fall
+   * back to their first participant (the creator).
+   */
+  ownerId: string | null;
   participants: ParticipantDto[];
   lastMessageAt: Date | null;
   createdAt: Date;
